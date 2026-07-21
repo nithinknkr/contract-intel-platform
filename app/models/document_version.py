@@ -7,14 +7,13 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
-
+from sqlalchemy import Enum, ForeignKey, func, Boolean, Integer, Index, UniqueConstraint, text, Text
 
 class ParseStatus(str, enum.Enum):
     PENDING = "pending"
     PARSING = "parsing"
     PARSED = "parsed"
     FAILED = "failed"
-
 
 class DocumentVersion(Base):
     __tablename__ = "document_versions"
@@ -41,10 +40,12 @@ class DocumentVersion(Base):
     )
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     storage_path: Mapped[str] = mapped_column(nullable=False)
+    file_hash: Mapped[str] = mapped_column(nullable=False, index=True)
     parse_status: Mapped[ParseStatus] = mapped_column(
         Enum(ParseStatus, name="parse_status",
              values_callable=lambda x: [e.value for e in x]),
         nullable=False, default=ParseStatus.PENDING,
     )
+    parse_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)

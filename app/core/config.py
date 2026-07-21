@@ -10,6 +10,8 @@ class Settings(BaseSettings):
 
     database_url: str
     environment: str = "development"
+    storage_base_dir: str = "./storage"
+    redis_url: str = "redis://localhost:6379/0"
 
 
 settings = Settings()
