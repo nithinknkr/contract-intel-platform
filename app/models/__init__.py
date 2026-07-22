@@ -8,3 +8,4 @@ from app.models.document import Document  # noqa: F401
 from app.models.document_version import DocumentVersion  # noqa: F401
 from app.models.chunk import Chunk  # noqa: F401
 from app.models.audit_log import AuditLog  # noqa: F401
+from app.models.refresh_token import RefreshToken  # noqa: F401

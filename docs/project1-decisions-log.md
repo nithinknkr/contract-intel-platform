@@ -521,3 +521,152 @@ Why deferred: Same reason as the upload endpoint's existing auth TODOs — there
 Trade-off accepted: Right now, any caller who knows or guesses a version UUID can poll any organization's document status — a real, explicitly named tenant-isolation gap, not silently shipped. Flagged with a code comment (# TODO: also filter by org_id once auth exists) directly at the query site.
 
 Interview angle: "This endpoint has a known, deliberately deferred tenant-isolation gap — it doesn't yet check that the caller's org matches the version's org, because there's no authenticated caller identity to check against until A4. I named this explicitly rather than let it sit as an invisible gap, and left a TODO directly at the query site so it can't be missed when auth lands."
+
+
+# Phase A4 Decisions
+
+---
+
+## Password Hashing Library
+**Phase:** A4
+**Date:** 22-07-2026
+
+**Options considered:** passlib[bcrypt] (the conventional FastAPI-tutorial default) vs the `bcrypt` package directly
+
+**Chosen:** `bcrypt` directly, no passlib
+
+**Why:** passlib's bcrypt backend reads a `bcrypt.__about__.__version__` attribute that bcrypt removed in 4.1+, breaking passlib's version detection; passlib itself hasn't shipped a fix since 2020 and is effectively unmaintained. Calling `bcrypt.hashpw`/`bcrypt.checkpw` directly removes a fragile, unnecessary abstraction layer for a two-function need.
+
+**Trade-off accepted:** Lose passlib's multi-algorithm abstraction (easy migration between hash schemes) — not a real cost here, since there's no plan to support multiple password hash algorithms simultaneously.
+
+**Interview angle:** *"I skipped passlib and called bcrypt directly, because passlib's bcrypt backend is actually broken against bcrypt 4.1 and later — it reads a version attribute bcrypt removed, and passlib hasn't been updated to fix it. That's one less unmaintained dependency for two functions I can call directly."*
+
+---
+
+## Token Strategy: Access + Refresh, No Rotation
+**Phase:** A4
+**Date:** 22-07-2026
+
+**Options considered:** (a) Access token only, short-lived, re-login on expiry. (b) Access + refresh pair, refresh token rotated on every use with reuse detection. (c) Access + refresh pair, refresh token NOT rotated — same token valid until natural expiry or explicit logout.
+
+**Chosen:** (c) — 30-minute access token (stateless JWT), 14-day refresh token (opaque, DB-backed, revocable via `revoked_at`)
+
+**Why:** Access-only forces re-login every 30 minutes, a real usability cost with no corresponding security benefit for this project's threat model. Full rotation + reuse detection (b) is a genuine defense-in-depth technique for production systems with real attackers, but disproportionate complexity for a solo portfolio project — the added code (tracking token families, detecting reuse, revoking on detected reuse) isn't something I could defend in depth if asked "walk me through why you needed this," versus the simpler revocable-refresh-token design, which I can.
+
+**Trade-off accepted:** A stolen refresh token remains valid for up to 14 days if not proactively revoked (no reuse detection to catch an attacker using it alongside the legitimate user). Accepted given the threat model of a portfolio project versus a production system with real user data at stake.
+
+**Interview angle:** *"I built access+refresh, not rotation. Rotation with reuse detection is the right answer for production, but I made a deliberate scope call not to build it here, because I couldn't defend the complexity for this project's actual threat model — I'd rather show a simpler design I fully understand than a fancier one I copied without being able to explain the trade-off."*
+
+---
+
+## Refresh Token Hashing: SHA-256, Not Bcrypt
+**Phase:** A4
+**Date:** 22-07-2026
+
+**Options considered:** Bcrypt (same as password hashing, for consistency) vs SHA-256
+
+**Chosen:** SHA-256
+
+**Why:** These are two different problems. Passwords are low-entropy, human-chosen secrets that need a deliberately slow, salted hash to resist brute-force — that's bcrypt's job. A refresh token is 512 bits of `secrets.token_urlsafe`-backed entropy — there's nothing to brute-force. More importantly, bcrypt's per-hash salt makes it *unsuitable* here: `/auth/refresh` needs an exact-match lookup by hash in a single indexed query, and a salted hash can't be looked up that way (you'd have to pull every stored token and `checkpw` each one). SHA-256 is fast, deterministic, and indexable — the correct tool for this specific job.
+
+**Trade-off accepted:** None material — using the "stronger" bcrypt here would actually be the wrong choice, not a safer one, since it breaks the required lookup pattern.
+
+**Interview angle:** *"I used two different hash functions for two different reasons: bcrypt for passwords because it needs to be slow, SHA-256 for refresh tokens because they need to be looked up by exact match, and a salted hash can't do that efficiently. Using bcrypt everywhere 'for consistency' would have been the less correct choice, not the safer one."*
+
+---
+
+## Current User Resolution: Re-query DB Every Request
+**Phase:** A4
+**Date:** 22-07-2026
+
+**Options considered:** Trust the JWT's embedded `org_id`/`role` claims directly (fully stateless, no DB hit) vs re-query the `users` table by `sub` on every authenticated request
+
+**Chosen:** Re-query the DB every request
+
+**Why:** A stateless JWT is only as current as the moment it was issued — if a user's role changes or their account is deactivated, a pure-claims approach means that change doesn't take effect until the access token naturally expires (up to 30 minutes later). Re-querying costs one extra indexed query per request in exchange for immediate consistency.
+
+**Trade-off accepted:** One additional DB round-trip per authenticated request — a real latency/throughput cost at scale, accepted here because correctness (a revoked admin losing access immediately, not in up-to-30-minutes) matters more than shaving one query for this project's actual load.
+
+**Interview angle:** *"I chose consistency over pure statelessness for `get_current_user` — the JWT still carries org_id and role, but I don't trust them blindly, I use the token only to identify who's asking, then re-check their current role from the database. That's a deliberate latency-for-correctness trade-off, not an oversight — a fully stateless version would be faster but means a role change or deactivation doesn't take effect until the token expires."*
+
+---
+
+## Document Deletion: Soft Delete (Archive) Only
+**Phase:** A4
+**Date:** 22-07-2026
+
+**Options considered:** Hard `DELETE FROM documents` vs soft delete via `is_archived=True` (the column already existed since A2)
+
+**Chosen:** Soft delete only — `DELETE /documents/{id}` sets `is_archived=True`, no hard-delete endpoint exists
+
+**Why:** This is a legal-tech product with an audit trail (A2's `audit_log` table) — an irrecoverable hard delete is a worse default than an archive a user can be shown/restored later. "We accidentally deleted evidence of a contract review" is a materially worse failure mode than "the document is hidden by default but still there."
+
+**Trade-off accepted:** No way to actually free storage/reduce row count via the API yet. If a genuine hard-delete need arises (e.g., a GDPR-style erasure request), it should be a separate, explicitly admin-only endpoint — not this verb's default behavior.
+
+**Interview angle:** *"Delete on this system doesn't delete — it archives. In a domain where losing evidence of what a contract review actually said is a real liability, I'd rather the default action be reversible, with a genuine hard-delete as a separate, more deliberate path if it's ever needed."*
+
+---
+
+## Bug: Full-Text Search Silently Matched Nothing on Real Filenames
+**Phase:** A4
+**Date:** 22-07-2026
+
+**What was found:** `GET /documents/search?q=original` returned `[]` against a document literally named `original.pdf`. Root cause, confirmed empirically against a real Postgres instance: `to_tsvector('english', 'original.pdf')` produces a single fused lexeme `'original.pdf'`, not separate `original`/`pdf` tokens — Postgres's default text search parser treats a `word.extension` pattern as one "file" token. The same issue affects underscores: `to_tsvector('english', 'Vendor_NDA_Agreement.pdf')` also produces one fused token, not three words. Since every realistic uploaded filename has an extension, and many will use underscores, the search feature as originally built would have matched almost nothing on real data — a demo would look broken with virtually any real contract filename.
+
+**Fix:** Changed the generated `search_vector` column's expression from `to_tsvector('english', filename)` to `to_tsvector('english', regexp_replace(regexp_replace(filename, '\.[^.]+$', ''), '[_-]', ' ', 'g'))` — strips the file extension and normalizes underscores/hyphens to spaces before tokenizing. Verified against multiple realistic cases (`Vendor_NDA_Agreement.pdf`, `Q3 Lease Agreement.pdf`, `original.pdf`) that each now indexes as separate, correctly stemmed lexemes, and that `plainto_tsquery('english', 'vendor')` now actually matches.
+
+**Why this matters:** This wasn't caught by design review — it was caught by actually testing the endpoint end-to-end with a real filename, exactly the "test both, briefly, so it isn't a hypothetical claim" discipline this project is meant to build. Also required a real Alembic mechanic worth knowing cold: a `GENERATED ALWAYS AS ... STORED` column's expression can't be `ALTER`ed in place — Postgres requires drop-and-recreate, and Alembic's autogenerate doesn't reliably detect an expression-only change to a computed column (it produced an empty migration on the first attempt), so the fix migration had to be hand-written.
+
+**Interview angle:** *"My full-text search worked perfectly against test data like 'the auto-renewal clause' but returned nothing against a document literally named original.pdf — because Postgres's tokenizer treats 'word.extension' as one fused token, not two words. I caught it by actually testing with a realistic filename instead of trusting the design, root-caused it against a real Postgres instance rather than guessing, and the fix — stripping the extension and normalizing separators before indexing — also taught me that generated columns can't be altered in place, which Alembic's autogenerate didn't handle correctly on its own."*
+
+---
+
+## Search: Archived Documents Excluded By Default
+**Phase:** A4
+**Date:** 22-07-2026
+
+**Options considered:** `GET /documents/search` always includes archived documents (findability over consistency) vs excludes them by default with an `include_archived` opt-in, matching `GET /documents`'s existing behavior
+
+**Chosen:** Excluded by default, `include_archived=true` param to opt in
+
+**Why:** Both are legitimate "browse my documents" surfaces (list and search) — having them default to different visibility rules would be an inconsistency I'd have to explain away rather than defend. Least-surprise principle: searching almost always means "help me find what I'm currently working with," not "show me everything including things I deliberately archived." Consistent with the soft-delete decision above — nothing is actually hidden forever, just not shown unless asked for.
+
+**Trade-off accepted:** A user who knows they archived something and wants to find it again must remember to pass `include_archived=true` — a minor discoverability cost, mitigated by it being an explicit, documented parameter rather than a hidden behavior difference between endpoints.
+
+**Interview angle:** *"I made list and search behave identically with respect to archived documents on purpose — same default, same opt-in parameter name. Two 'browse' endpoints on the same resource silently disagreeing about what 'show me my documents' means is exactly the kind of inconsistency that looks like a bug even when each individual behavior is defensible on its own."*
+
+---
+
+## Known Gap (Deferred, Not Yet Decided): No Way to Add a User to an Existing Organization
+**Phase:** A4
+**Date:** 22-07-2026
+
+**What was found:** Testing role-gating (viewer vs admin) required manually `INSERT`-ing a second user directly into Postgres via `psql`, because no API path exists to add a user to an org that already has one — `POST /auth/signup` always creates a brand-new organization with the caller as its sole admin. This means, as the system stands, an organization can never legitimately grow past its founding user through the API.
+
+**Status:** Explicitly flagged as a real, named product gap — not silently shipped, not yet resolved. Not fixed in A4; needs a deliberate decision (invite-by-email flow? admin-creates-user-directly endpoint? something else?) before being built, rather than being bolted on reactively.
+
+**Interview angle:** *"While testing role-based access control, I hit a real gap empirically, not hypothetically: there's currently no way for a second person to join an existing organization through the API at all — I had to insert a user directly into Postgres to test it. I've deliberately left this open rather than rushing a fix, because the right shape for that flow (invite links vs admin-created accounts vs something else) deserves an actual decision, not a bolt-on."*
+
+## Audit Log Wiring: Auth + Document Events
+**Phase:** A4
+**Date:** 22-07-2026
+
+**What was done:** Wired `AuditLogRepository.create()` into six real events, following the `resource.verb` naming convention established in A2: `user.signed_up`, `user.logged_in`, `user.login_failed`, `user.logged_out`, `document.uploaded`, `document.upload_deduplicated`, `document.archived`. Each write happens in the same DB transaction as the action it's logging (added before the existing `db.commit()`, not a separate commit) — an audit entry and the event it describes succeed or fail together, not as two independent writes that could disagree.
+
+**Why this matters:** This is the first real consumer of the append-only `AuditLogRepository` built in A2 — it sat unused for two phases. Choosing to log the *dedup* case (`document.upload_deduplicated`) separately from a real upload was a deliberate call: they're different events worth distinguishing in a real audit trail (a user re-uploading the same file isn't the same story as a genuinely new document), not just noise to collapse into one action.
+
+**Trade-off accepted:** `/auth/refresh` is deliberately NOT logged — at a ~30-minute access token lifetime, it would fire roughly as often as normal usage, adding volume without adding signal. Login/logout are the meaningful session boundaries; a routine refresh isn't.
+
+**Interview angle:** *"The audit_log table and its repository existed since A2, but had zero real callers until A4 — I built the shape without a concrete consumer, which is a normal sequencing call for schema work, but it meant nothing was actually proven correct until I wired six real events in and empirically confirmed rows landing correctly, including making sure each write shares a transaction with the action it describes."*
+
+---
+
+## Known Gap: Unknown-Email Failed Logins Aren't Audit-Logged
+**Phase:** A4
+**Date:** 22-07-2026
+
+**What was found:** `audit_log.org_id` is `NOT NULL` (by design, from A2 — every audit row belongs to a tenant). A failed login against an email that doesn't exist at all has no `org_id` to attribute the attempt to, so it can't be written to this table. Only failed attempts against a *known* email (wrong password, correct email) get logged, since only that case has a resolvable `org_id`.
+
+**Status:** Named and accepted, not fixed. A real limitation for security monitoring — this table alone can't detect someone probing random/guessed emails, only someone repeatedly failing against one they got right. A genuine fix would mean either a separate, org-independent security-events table, or relaxing `org_id` to nullable specifically for this one row type — neither was judged worth doing for this project's actual scope.
+
+**Interview angle:** *"My audit log can't see every failed login attempt — only ones against emails that actually exist, because the schema deliberately requires every row to belong to an organization, and an unknown email has none. I could've relaxed that constraint to catch the blind case too, but chose not to, since it would weaken a guarantee (every audit row is tenant-attributable) for a monitoring capability outside this project's actual scope. Worth naming as a real trade-off rather than pretending the audit trail is more complete than it is."*
