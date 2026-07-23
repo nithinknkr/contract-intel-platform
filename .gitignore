@@ -1,9 +1,11 @@
 # Virtual environment
 venv/
 storage/
+storage_test/
 
 # Environment variables
 .env
+.env.test
 
 # Python cache
 __pycache__/
@@ -20,3 +22,6 @@ __pycache__/
 
 # Logs
 *.log
+# Coverage
+.coverage
+htmlcov/
