@@ -670,3 +670,119 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Status:** Named and accepted, not fixed. A real limitation for security monitoring — this table alone can't detect someone probing random/guessed emails, only someone repeatedly failing against one they got right. A genuine fix would mean either a separate, org-independent security-events table, or relaxing `org_id` to nullable specifically for this one row type — neither was judged worth doing for this project's actual scope.
 
 **Interview angle:** *"My audit log can't see every failed login attempt — only ones against emails that actually exist, because the schema deliberately requires every row to belong to an organization, and an unknown email has none. I could've relaxed that constraint to catch the blind case too, but chose not to, since it would weaken a guarantee (every audit row is tenant-attributable) for a monitoring capability outside this project's actual scope. Worth naming as a real trade-off rather than pretending the audit trail is more complete than it is."*
+
+# Phase A5 Decisions
+
+---
+
+## Test Database Strategy: Separate Postgres DB via Alembic, Not `create_all()`
+**Phase:** A5
+**Date:** 23-07-2026
+
+**Options considered:** `Base.metadata.create_all()` against a test DB vs. running the real Alembic migration chain (`alembic upgrade head`) against a separate test database
+
+**Chosen:** Separate `contract_intel_test` database in the existing Postgres container, schema built exclusively via `alembic upgrade head`
+
+**Why:** `documents.search_vector` is a hand-migrated `GENERATED ALWAYS AS (...) STORED` column (A4) that exists only as raw migration SQL, not as an ORM-expressible `Column`/`Computed()` construct — `create_all()` would silently produce a schema missing that column and its GIN index, and full-text search tests would fail or, worse, pass against a schema that doesn't match production. Running the real migration chain is also itself a valuable end-to-end check: the first time all 8 migrations replayed cleanly against a genuinely fresh database.
+
+**Trade-off accepted:** Slower test-suite bootstrap than `create_all()`, and the test DB must be manually created once (`CREATE DATABASE`) before migrations can run — not automated as part of the test run itself.
+
+**Interview angle:** *"I deliberately didn't use SQLAlchemy's create_all() for the test database, because one of my columns — a generated tsvector column for full-text search — only exists as hand-written migration SQL, not as an ORM construct. create_all() would have silently built a test schema that didn't match production. Running the real Alembic chain against a fresh database also doubled as the first real proof that my full migration history replays cleanly end-to-end."*
+
+---
+
+## Settings/Engine Import-Time Binding: `.env.test` Must Load Before Any `app.*` Import
+**Phase:** A5
+**Date:** 23-07-2026
+
+**Options considered:** Override `DATABASE_URL` via a pytest fixture/monkeypatch after imports vs. loading a separate `.env.test` file before any application import happens
+
+**Chosen:** `load_dotenv(".env.test", override=True)` as the literal first executable lines in `conftest.py`, before any `from app...` import anywhere in the import chain
+
+**Why:** Both `Settings()` (config.py) and the SQLAlchemy `engine` (session.py) are constructed once at module import time, not lazily per-request. A fixture-level override (e.g. monkeypatching `settings.database_url` inside a test) would not affect the already-constructed `engine` object, which is bound to whatever DB was live at import time — silently running tests against the dev database instead of the test database. The only correct fix is controlling environment state before the first import, not after.
+
+**Trade-off accepted:** A fragile ordering constraint that isn't enforced by any tooling — a future contributor (or future me) adding an `import app.something` above the `load_dotenv` call in `conftest.py` would silently break test isolation with no error message, just tests quietly running against the dev DB. Documented with a loud comment at the top of `conftest.py`, not otherwise guarded against.
+
+**Interview angle:** *"I found a real gotcha with module-level singletons: my Settings object and DB engine are both constructed once, at import time. That means you can't swap the test database with a normal fixture override — by the time a fixture runs, the engine's already bound to the wrong DB. The fix has to happen before the first app import in the whole test session, which is a real ordering constraint I had to get right, not just a convenience."*
+
+---
+
+## Test Isolation: Outer Transaction + Auto-Restarting SAVEPOINT per Test
+**Phase:** A5
+**Date:** 23-07-2026
+
+**Options considered:** Truncate all tables between tests vs. recreate schema per test vs. wrap each test in an outer transaction with a nested SAVEPOINT that auto-restarts after every `session.commit()`
+
+**Chosen:** Outer transaction + auto-restarting SAVEPOINT (the standard SQLAlchemy "join a savepoint" pattern)
+
+**Why:** Route handlers call `db.commit()` throughout the real code (`documents.py`, `auth.py`) — a naive single-transaction-per-test approach would break the moment any route under test committed, since that would end the transaction the test's rollback depends on. The SAVEPOINT pattern lets route-level commits behave normally during the test while the true rollback boundary (the outer transaction) is untouched, discarding all test data on teardown regardless of how many commits happened inside.
+
+**Trade-off accepted:** More complex fixture code than truncation, and genuinely subtle if something goes wrong (a `session.expire_all()` at the wrong point, or an event listener misfiring, produces confusing test pollution rather than a clean error). Verified empirically (not just assumed correct) by confirming `SELECT count(*) FROM users` returned 0 against the real test DB after a signup test ran.
+
+**Interview angle:** *"Because my routes commit mid-request, a simple 'wrap the test in a transaction and roll back' approach doesn't work on its own — the route's own commit would end that transaction early. I used the SAVEPOINT pattern instead, and I didn't just trust it — I directly queried the test database after a signup test ran and confirmed the row count was zero, proving the rollback boundary actually holds."*
+
+---
+
+## RQ Enqueue Mocked in Tests, Not Exercised via Real Redis/Worker
+**Phase:** A5
+**Date:** 23-07-2026
+
+**Options considered:** Run a real RQ worker against real Redis during integration tests vs. mock `document_queue.enqueue` and assert on call arguments only
+
+**Chosen:** Mocked, autouse fixture (`mock_enqueue`) replacing `enqueue` with a call-recording stub
+
+**Why:** A3 already empirically proved queue mechanics work correctly (stopped/restarted worker, confirmed jobs sit pending in Redis and get picked up) — re-proving that in A5 would be redundant effort. A5's actual job is proving the upload endpoint hands off the *correct* work (right function, right version ID), not re-verifying Redis/RQ delivery.
+
+**Trade-off accepted:** A5's test suite would not catch a regression in actual RQ/Redis wiring (e.g., a broken Redis connection string) — that class of failure is outside this phase's scope and would need a separate, deliberately-live integration test to catch, not currently built.
+
+**Interview angle:** *"I mocked the queue call rather than running a real worker in tests, because I'd already proven the queue mechanics manually in an earlier phase — re-testing Redis delivery here would be duplicated effort. What I actually wanted A5 to prove was narrower: that uploading a document hands off the right job with the right arguments, which a mock lets me assert directly and quickly."*
+
+---
+
+## Sync `TestClient` Used Instead of `httpx.AsyncClient`
+**Phase:** A5
+**Date:** 23-07-2026
+
+**Options considered:** `pytest-asyncio` + `httpx.AsyncClient` (as originally specified in the execution plan) vs. FastAPI's synchronous `TestClient`
+
+**Chosen:** Synchronous `TestClient`
+
+**Why:** Every route in the application is defined as a regular `def`, not `async def` — there is no async code path anywhere in the request-handling flow for an async client to meaningfully exercise differently from a sync one. Introducing `pytest-asyncio` and async fixtures would have added real complexity (event loop management, async fixture chaining) with no corresponding coverage benefit.
+
+**Trade-off accepted:** A direct deviation from the execution plan's stated tooling ("pytest + httpx.AsyncClient"). If future phases introduce genuinely async routes (e.g., a streaming RAG response in Phase B), this decision should be revisited rather than carried forward by default.
+
+**Interview angle:** *"My execution plan called for httpx.AsyncClient, but every route in my app is synchronous — there was no async behavior for an async client to actually test differently. I made a deliberate call to use the simpler sync TestClient instead, and documented the deviation rather than following the plan just because it was written down. I'd revisit this the moment a route actually becomes async."*
+
+---
+
+## Known Gap: Test-Storage Cleanup Not Implemented
+**Phase:** A5
+**Date:** 23-07-2026
+
+**What was found:** Unlike the database (rolled back per test via the SAVEPOINT pattern), files written to disk during upload tests (`storage_test/`) are not cleaned up automatically — confirmed empirically: after a full test run, dozens of orphaned PDF folders remained in `storage_test/` despite all corresponding DB rows being rolled back.
+
+**Status:** Named, not fixed. `storage/` (the real dev storage directory) was separately confirmed untouched by any test run — the actual risk (test writes polluting real data) doesn't exist; this is purely a test-artifact accumulation issue in a disposable, gitignored directory.
+
+**Interview angle:** *"My test isolation covers the database but not the filesystem — uploaded test files accumulate in a separate test-only storage directory across runs. I verified the real storage directory is never touched, so there's no data-safety risk, but a proper fix would be a tmp_path-based fixture or a session-end cleanup step. I left it as a named gap rather than building it, since it doesn't affect correctness, only disk usage in a throwaway, gitignored folder."*
+
+---
+
+## Auth Flow Test Coverage: Signup, Login, Refresh, Logout
+**Phase:** A5
+**Date:** 23-07-2026
+
+**What was done:** Added `tests/integration/test_auth.py` — 10 tests covering signup (success + duplicate-email 409), login (success, wrong password, unknown email), refresh (success + invalid token), and logout (revokes token + idempotent on unknown token). Specifically included a test asserting the login endpoint returns an *identical* status code and detail message for "wrong password" vs. "unknown email" — directly verifying the anti-enumeration property documented in `auth.py`'s own code comments, rather than just trusting the comment.
+
+**Why this matters:** This was initially scoped out of A5 as a named gap (auth got exercised only indirectly via the `signed_up_client` fixture used by every other test file) and closed deliberately before moving to A6, rather than left open. Coverage on `app/routers/auth.py` went from 55% to 99%.
+
+**Interview angle:** *"I initially scoped auth out of A5 since it was getting indirect coverage from every other test's setup fixture, but I went back and closed it properly before moving on — including a test that doesn't just check status codes, but actually verifies the anti-enumeration security property I'd documented: that a wrong password and an unknown email produce byte-identical responses, so an attacker can't use the login endpoint to enumerate valid accounts."*
+
+---
+
+## A5 Final State
+**Phase:** A5
+**Date:** 23-07-2026
+
+**Summary:** 33 automated tests (10 auth, 4 search, 4 upload, 1 ingestion idempotency, 3 tenant isolation via API, 5 chunking, 4 parsing, 2 tenant isolation via repository), 89% overall code coverage, run together in a single suite with no cross-test pollution. Manual verification scripts from earlier phases (`test_chunking.py`, `test_parsing.py`, `test_reprocess.py`, `smoke_test_isolation.py`) were deleted after their scenarios were formalized as real pytest cases.
+
+**Interview angle:** *"By the end of A5 I had 33 tests replacing what used to be four manual scripts I had to remember to re-run by hand. The same scenarios are now checked automatically, every time, and I have an honest coverage number — 89% — rather than a vague sense that things probably still work."*
