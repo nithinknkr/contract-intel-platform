@@ -1,0 +1,11 @@
+venv/
+storage/
+storage_test/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.env
+.env.test
+docs/
+.coverage

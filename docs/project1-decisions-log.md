@@ -786,3 +786,36 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Summary:** 33 automated tests (10 auth, 4 search, 4 upload, 1 ingestion idempotency, 3 tenant isolation via API, 5 chunking, 4 parsing, 2 tenant isolation via repository), 89% overall code coverage, run together in a single suite with no cross-test pollution. Manual verification scripts from earlier phases (`test_chunking.py`, `test_parsing.py`, `test_reprocess.py`, `smoke_test_isolation.py`) were deleted after their scenarios were formalized as real pytest cases.
 
 **Interview angle:** *"By the end of A5 I had 33 tests replacing what used to be four manual scripts I had to remember to re-run by hand. The same scenarios are now checked automatically, every time, and I have an honest coverage number — 89% — rather than a vague sense that things probably still work."*
+
+
+## A6 (CI/CD Pipeline) — Paused Mid-Setup, Deferred to End of Project
+**Phase:** A6
+**Date:** 25-07-2026
+
+**What was done:** Started A6 — installed Ruff (`ruff==0.16.0`, committed to `requirements.txt` on `main`), began configuring `pyproject.toml` for lint/format rules, and set up a `ci/setup-github-actions` branch to hold the work. Paused before writing the actual GitHub Actions workflow file. The `pyproject.toml` config was deleted rather than left half-correct; `main` currently has the unused `ruff` dependency with no matching config, and the `ci/setup-github-actions` branch is stale (predates the one commit that landed on `main` directly, bypassing the branch/PR flow that was the intended workflow for this phase).
+
+**Why paused:** No functional dependency blocks this — nothing in Phase A or B requires CI/CD to exist; A7 can be deployed manually, and Phase B doesn't touch this at all. The friction hitting so far was entirely terminal/editor mechanics (heredocs not pasting cleanly into `nano`, multi-line paste behavior), not the CI/CD concepts themselves — a different kind of blocker than the actual engineering work in this project, and not worth grinding through at the cost of momentum on higher-value phases.
+
+**Status:** Deliberately deferred, not abandoned — to be resumed at the end of the project, after Phase A and B are complete, using a cleaner setup approach (avoiding the heredoc/paste issues that caused the friction this round).
+
+**Trade-off accepted:** `main` temporarily carries an unused `ruff==0.16.0` line with no config behind it — a small, harmless loose end, cheap to close when A6 resumes. No automated test/lint gate exists yet, meaning pushes to `main` between now and A6's completion aren't protected by CI — an accepted risk given the project is solo-developed and each phase is already manually verified before moving on.
+
+**Interview angle:** *"I started A6, got Ruff installed and was mid-way through the GitHub Actions config, and made a deliberate call to pause it — not because the CI/CD work itself was hard, but because I hit a run of pure terminal-tooling friction that wasn't worth grinding through at the cost of momentum on the actual differentiating engineering in Phase B. I'd rather come back to it later with a cleaner setup than push through irritated and end up with a workflow file I don't fully understand."*
+
+---
+
+## No Frontend — Backend-Only Scope, `/docs`/Postman as Demo Surface
+**Phase:** Scope (cross-cutting)
+**Date:** 25-07-2026
+
+**Options considered:** Build a minimal frontend now, in parallel with Phase A/B vs. defer any frontend decision entirely until Phase A and B are both complete vs. never build one, rely permanently on `/docs`/Postman for demos
+
+**Chosen:** Defer — no frontend work happens during Phase A or B; revisit only after both are fully complete
+
+**Why:** The spec, execution plan, and every phase so far were written with a backend-only scope from the start — A7's own verification step is "confirm `/docs` works," not "confirm a UI works," which was never accidental. The interview-differentiating work in this project (citation verification, injection defense, hybrid retrieval, eval harness) lives entirely in the backend/AI layer; a frontend competing for time during Phase A/B would dilute focus away from the harder, rarer engineering this project is actually meant to demonstrate. Deferring the decision itself — rather than either committing to "never" or building one reactively mid-phase — keeps the option open without letting it become scope creep now.
+
+**Trade-off accepted:** No polished visual demo exists until after Phase B — interview demos until then rely entirely on Swagger UI (`/docs`) and Postman walkthroughs. If a live visual demo becomes needed sooner (e.g. sharing the project link informally before Phase B finishes), this decision would need revisiting.
+
+**Interview angle:** *"This project never had a frontend in scope — deliberately. The verification checkpoints throughout the plan use Swagger UI and Postman, not a UI, because the differentiating engineering here is the backend and AI-safety layer: citation verification, injection defense, hybrid retrieval. I made an explicit call to defer any frontend decision until after Phase B, rather than let it dilute focus or get bolted on reactively mid-build."*
+
+---
