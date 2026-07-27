@@ -788,6 +788,7 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Interview angle:** *"By the end of A5 I had 33 tests replacing what used to be four manual scripts I had to remember to re-run by hand. The same scenarios are now checked automatically, every time, and I have an honest coverage number — 89% — rather than a vague sense that things probably still work."*
 
 
+# Phase A6 Decisions.
 ## A6 (CI/CD Pipeline) — Paused Mid-Setup, Deferred to End of Project
 **Phase:** A6
 **Date:** 25-07-2026
@@ -819,3 +820,154 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Interview angle:** *"This project never had a frontend in scope — deliberately. The verification checkpoints throughout the plan use Swagger UI and Postman, not a UI, because the differentiating engineering here is the backend and AI-safety layer: citation verification, injection defense, hybrid retrieval. I made an explicit call to defer any frontend decision until after Phase B, rather than let it dilute focus or get bolted on reactively mid-build."*
 
 ---
+
+
+# Phase A7 Decisions
+
+---
+
+## Hosting Platform Selection: Render over Fly.io
+**Phase:** A7
+**Date:** 25-07-2026
+
+**Options considered:** Render vs Fly.io (both free-tier, both viable for a containerized FastAPI deployment)
+
+**Chosen:** Render
+
+**Why:** This was my first deployment ever, and Render's dashboard-driven UX gives more visual feedback while learning what's actually happening at each step — service creation, environment variables, build logs — versus Fly.io's more CLI-driven flow. Fly.io generally has faster cold-starts and a steeper learning curve; Render trades some of that performance for a gentler first-deployment experience, which mattered more given zero prior deployment experience.
+
+**Trade-off accepted:** Render's free tier spins down after 15 minutes of inactivity, and the first request after idle can take 30-60 seconds to respond — a real, user-facing limitation for a live demo, explicitly documented in the README rather than discovered by surprise.
+
+**Interview angle:** *"I chose Render over Fly.io for my first deployment specifically for the learning experience — a dashboard-driven flow with visible build logs at every step, versus a CLI-first tool. I made the trade-off deliberately: Render's free tier has a real cold-start delay I now have to account for and document, but the platform itself was the right choice for actually understanding what a deployment pipeline does, not just running a command that works."*
+
+---
+
+## Hosted Database Selection: Neon over Supabase
+**Phase:** A7
+**Date:** 25-07-2026
+
+**Options considered:** Neon vs Supabase (both free-tier hosted Postgres)
+
+**Chosen:** Neon
+
+**Why:** Supabase bundles Postgres with auth, storage, and realtime features that overlap with things I've already built myself (JWT auth from A4, local disk storage from A3) — using it would mean either ignoring most of its surface area or being tempted into scope creep. Neon is Postgres-only, which matches exactly what this project needs from a hosted database: nothing more.
+
+**Trade-off accepted:** None material — Neon's feature set is a strict subset of what I needed, no capability was given up.
+
+**Interview angle:** *"I picked Neon over Supabase because Supabase's extra features — auth, storage, realtime — would have been redundant against systems I'd already built myself. I wanted a database, not a platform, and didn't want the temptation of scope creep into features this project doesn't need."*
+
+---
+
+## Postgres Version Pinned to 16 on Neon (Not Neon's Default of 18)
+**Phase:** A7
+**Date:** 25-07-2026
+
+**Options considered:** Accept Neon's default Postgres version (18) vs explicitly select 16 to match local dev
+
+**Chosen:** Postgres 16, matching the local Docker Compose environment exactly
+
+**Why:** My local dev database (per the A2 decision) runs Postgres 16, and my migrations — including the hand-written `GENERATED ALWAYS AS ... STORED` column fix from A4 — were tested against that exact version. A version mismatch between dev and prod is a known source of subtle, hard-to-diagnose behavior differences; keeping them identical removes an entire class of "works locally, breaks in prod" risk for zero cost.
+
+**Trade-off accepted:** None — explicitly selecting a dropdown option instead of accepting a default costs nothing.
+
+**Interview angle:** *"Neon defaulted to Postgres 18, but I deliberately pinned it to 16 to match my local Docker environment exactly — my migrations, including a hand-written generated-column fix from A4, were tested against 16 specifically. Dev/prod version parity isn't glamorous, but it's exactly the kind of detail that prevents a confusing bug three weeks from now."*
+
+---
+
+## Docker Language Auto-Detect Mismatch on Render (Caught Before Deploying)
+**Phase:** A7
+**Date:** 25-07-2026
+
+**What was found:** When creating the Render web service, Render auto-detected "Language: Python 3" instead of Docker — silently defaulting to its own native Python buildpack (auto-filled Build/Start Command fields showing `pip install -r requirements.txt` / `gunicorn your_application.wsgi`, the latter being generic Django-style boilerplate, not even correct for a FastAPI/uvicorn app). Had this gone unnoticed, Render would have completely bypassed the multi-stage Dockerfile that had already been written and tested locally.
+
+**Fix:** Manually changed the "Language" dropdown from `Python 3` to `Docker` before deploying, which removed the Build/Start Command fields entirely (correct — the Dockerfile's own `CMD` defines the start command) and confirmed Render would build from the actual Dockerfile.
+
+**Why this matters:** This wasn't a hypothetical risk — it's the literal default behavior Render would have shipped with if the setup screen hadn't been read carefully. Auto-detected tooling defaults are worth verifying explicitly, not trusting blindly, especially the first time using a new platform.
+
+**Interview angle:** *"Render auto-detected my repo as a plain Python app and was about to deploy using its own buildpack and a generic gunicorn start command, completely ignoring the Dockerfile I'd already built and tested — I caught it by actually reading the auto-filled fields instead of clicking through the setup screen on autopilot, and switched the language selector to Docker before deploying."*
+
+---
+
+## `.dockerignore` Added After Discovering 228MB Build Context
+**Phase:** A7
+**Date:** 25-07-2026
+
+**What was found:** The first local `docker build` reported `transferring context: 228.00MB` — far too large for a FastAPI backend's actual source code. Root cause: no `.dockerignore` existed, so Docker was sweeping `storage/`, `storage_test/` (dozens of test PDFs accumulated across earlier phases), and other local-only artifacts into the build context, and `COPY . .` in the Dockerfile was copying all of it into the final image.
+
+**Fix:** Added a `.dockerignore` file excluding `venv/`, `storage/`, `storage_test/`, `__pycache__/`, `.pytest_cache/`, `.git/`, `.env`, `.env.test`, `docs/`, and `.coverage`. Rebuilding afterward dropped the build context from 228MB to 9.33kB, and subsequent builds became dramatically faster due to Docker's layer caching working correctly on the now-minimal context.
+
+**Why this matters:** Without this fix, every deployed image would have silently shipped dozens of local test PDFs and potentially the entire `venv/` directory — bloating the image, slowing every future build/deploy, and leaking local test artifacts into what's actually running in production. Caught by actually reading the build output line-by-line, not by assuming the build "just worked" because it completed successfully.
+
+**Interview angle:** *"My first Docker build transferred 228MB of build context for what should be a lightweight FastAPI app — I hadn't written a `.dockerignore`, so Docker was sweeping in test PDFs and other local-only artifacts that had accumulated over five phases of development. Adding `.dockerignore` dropped that to under 10KB and meant my deployed image wasn't silently shipping test data that had nothing to do with the running application."*
+
+---
+
+## Multi-Stage Dockerfile Build
+**Phase:** A7
+**Date:** 25-07-2026
+
+**Options considered:** Single-stage Dockerfile (install dependencies and run in the same image) vs multi-stage build (separate build stage for dependency installation, copy only the result into a clean final image)
+
+**Chosen:** Multi-stage build — a `builder` stage runs `pip install --user`, and the final runtime stage copies only the installed packages (`/root/.local`) plus application code, starting from a fresh `python:3.12-slim` base.
+
+**Why:** A single-stage build would leave pip's build artifacts, caches, and any transient install-time files inside the final image — none of which are needed at runtime. Multi-stage builds produce a smaller final image with a smaller attack surface, at the cost of a slightly longer/more complex Dockerfile.
+
+**Trade-off accepted:** More verbose Dockerfile (two `FROM` statements, an explicit `--from=builder` copy) versus a single-stage file — a small, one-time complexity cost for a real, recurring image-size benefit.
+
+**Interview angle:** *"I used a multi-stage Docker build so my final deployed image only contains what's actually needed at runtime — the installed Python packages and my application code — not the pip cache and build artifacts left over from installing dependencies. It's a standard production pattern, and worth the extra few lines of Dockerfile for a meaningfully smaller, cleaner final image."*
+
+---
+
+## Credential Exposure and Rotation: Neon Password and JWT Secret
+**Phase:** A7
+**Date:** 25-07-2026
+
+**What happened:** During the Alembic-against-Neon migration step and the first local Docker container test, the real Neon database connection string (including password) was pasted directly into the AI assistant chat twice, and the real `JWT_SECRET_KEY` value once — despite being explicitly asked not to, to keep credentials out of any channel beyond a password manager or gitignored local file.
+
+**Response:** Reset the Neon database password immediately upon being flagged, generated a fresh `JWT_SECRET_KEY` via `secrets.token_urlsafe(64)`, and used only the rotated credentials going forward — including in Render's environment variables, entered directly into Render's dashboard rather than shared anywhere else.
+
+**Why this matters:** This is a genuine security-hygiene lapse worth documenting honestly rather than omitting — the actual behavior that matters isn't "never make this mistake," it's "notice it, rotate immediately, and don't let a leaked credential stay live." A real production incident response looks exactly like this at small scale: contain, rotate, verify.
+
+**Trade-off accepted:** None — the fix (password rotation) is a complete remediation with no residual risk once the old credentials were invalidated.
+
+**Interview angle:** *"Early in my first deployment, I pasted a real database credential into a chat channel I'd been told to keep it out of — a genuine mistake, not a hypothetical one. What matters is what I did next: I rotated the password immediately, generated a fresh JWT secret, and made sure only the new credentials were ever used going forward. I'd rather be honest about that than pretend it didn't happen — recognizing and immediately remediating a credential exposure is itself a real, demonstrable security practice."*
+
+---
+
+## Free-Tier Cold Start Investigated, Not Assumed
+**Phase:** A7
+**Date:** 25-07-2026
+
+**What was found:** The first live upload request against the deployed API returned a plain-text `Internal Server Error` with no JSON body — but a follow-up request against the same file immediately returned a normal, successful response with `"duplicate": true`. Rather than assuming the first request had genuinely failed server-side, checked the actual evidence: a `GET /documents` call showed exactly one document row existed, meaning the first request had, in fact, succeeded in creating the document — only the response delivery back to the client was disrupted.
+
+**Conclusion:** The most likely explanation is Render's free-tier cold-start behavior (the dashboard itself warns that an idle instance can delay the first request by 50+ seconds), not a bug in the application. The evidence (exactly one document row, correctly deduplicated second request) is consistent with this and inconsistent with a genuine server-side failure on the first request.
+
+**Why this matters:** The instinct to verify actual state (query the document list, check the row count) rather than accept a confusing client-side error message at face value is the same discipline applied throughout this project's tenant-isolation and idempotency testing (A2, A3) — applied here to a deployment-environment quirk instead of application logic.
+
+**Trade-off accepted:** Render's server logs for that exact request window weren't independently checked to fully rule out a transient server-side error — the dedup evidence was judged sufficiently conclusive on its own, though a stronger confirmation would have cross-referenced Render's logs directly.
+
+**Interview angle:** *"My first live upload request came back as a generic Internal Server Error, but instead of assuming the app was broken, I checked the actual state — queried the document list and found exactly one row had been created, and a retry correctly triggered my dedup logic. That told me the request had actually succeeded server-side; only the response back to the client was disrupted, almost certainly by Render's free-tier cold-start delay, which the platform itself warns about. I verified against real state rather than trusting a confusing error message."*
+
+---
+
+## No Worker Deployed — Processing Intentionally Stays `pending` in Production
+**Phase:** A7
+**Date:** 25-07-2026
+
+**What was done:** Deployed only the FastAPI web service to Render. No Redis instance and no RQ worker process were deployed alongside it — `REDIS_URL` is set to a placeholder value that nothing in the web service actually connects to at boot time. Verified live: an uploaded document's `parse_status` remains `pending` indefinitely on the deployed instance, since nothing is consuming the (non-existent, in production) job queue.
+
+**Why:** A7's stated goal is proving the containerized web API deploys and serves real traffic correctly — not standing up the full async processing infrastructure, which is a separate, later concern (worker deployment, a hosted Redis instance, etc.). Scoping A7 to the web service alone keeps this phase's actual goal achievable and verifiable without conflating it with a second deployment target.
+
+**Trade-off accepted:** The live demo cannot currently process uploaded documents end-to-end — uploads succeed and are stored, but parsing/chunking never happens on the deployed instance. Explicitly documented in the README as a known, deliberate limitation rather than left for a visitor to discover confused. This exact scenario — upload succeeds, processing stays `pending` with no worker running — was already proven safe and expected behavior locally in A3.
+
+**Interview angle:** *"I deployed the web API on its own, deliberately, without a background worker — that's a separate deployment target I haven't built yet, not an oversight. I verified live that uploads succeed and are stored correctly, and that processing correctly stays pending with no worker running, which is exactly the behavior I'd already proven safe locally back in Phase A3. I documented this as a known limitation in the README rather than let someone discover a 'broken' feature that's actually just an intentionally unbuilt one."*
+
+---
+
+## A7 Final State
+**Phase:** A7
+**Date:** 25-07-2026
+
+**Summary:** Application successfully containerized (multi-stage Dockerfile, `.dockerignore`-optimized build context), deployed to Render from GitHub with auto-deploy on push to `main`, backed by a hosted Neon Postgres 16 instance with the full migration chain applied. Live URL verified end-to-end: signup, login, document upload with correct org-wide deduplication, tenant-scoped document listing, version status polling, and full-text search all confirmed working against the real deployed stack — not just locally. README first pass written with architecture diagrams, honest documentation of current limitations (no worker deployed, free-tier cold starts), and setup instructions matched to the actual `docker-compose.yml`.
+
+**Interview angle:** *"By the end of A7 I had a live, publicly reachable URL running the actual containerized application against a real hosted database — and I didn't just deploy it and call it done, I walked through the full upload-to-search flow against production to prove it actually works, catching real issues along the way: a build-context bloat, a platform auto-detect defaulting to the wrong build path, and a credential I had to rotate after a handling mistake. Each of those became something I understood and fixed, not just something that happened to me."*
