@@ -19,5 +19,15 @@ services:
       - "6379:6379"
     restart: unless-stopped
 
+  chromadb:
+    image: chromadb/chroma:0.5.20
+    container_name: contract-intel-chromadb
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  chroma_data:

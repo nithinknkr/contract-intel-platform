@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     storage_base_dir: str = "./storage"
     redis_url: str = "redis://localhost:6379/0"
+    chroma_url: str = "http://localhost:8001"
 
     # --- Auth (added in A4) ---
     jwt_secret_key: str

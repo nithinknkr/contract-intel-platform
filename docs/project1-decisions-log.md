@@ -971,3 +971,116 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Summary:** Application successfully containerized (multi-stage Dockerfile, `.dockerignore`-optimized build context), deployed to Render from GitHub with auto-deploy on push to `main`, backed by a hosted Neon Postgres 16 instance with the full migration chain applied. Live URL verified end-to-end: signup, login, document upload with correct org-wide deduplication, tenant-scoped document listing, version status polling, and full-text search all confirmed working against the real deployed stack — not just locally. README first pass written with architecture diagrams, honest documentation of current limitations (no worker deployed, free-tier cold starts), and setup instructions matched to the actual `docker-compose.yml`.
 
 **Interview angle:** *"By the end of A7 I had a live, publicly reachable URL running the actual containerized application against a real hosted database — and I didn't just deploy it and call it done, I walked through the full upload-to-search flow against production to prove it actually works, catching real issues along the way: a build-context bloat, a platform auto-detect defaulting to the wrong build path, and a credential I had to rotate after a handling mistake. Each of those became something I understood and fixed, not just something that happened to me."*
+
+
+
+### Phase - B 
+# Phase B1 Decisions
+
+---
+
+## Embedding Model Selection: BAAI/bge-small-en-v1.5 over MiniLM
+**Phase:** B1
+**Date:** 28-07-2026
+
+**Options considered:** `sentence-transformers/all-MiniLM-L6-v2` (common tutorial default) vs `BAAI/bge-small-en-v1.5`
+
+**Chosen:** `BAAI/bge-small-en-v1.5`
+
+**Why:** bge-small outperforms MiniLM on MTEB retrieval benchmarks while remaining CPU-friendly (133MB model weights, 384-dimension output) — no GPU required, consistent with this project's "no API cost, runs locally" embedding philosophy already stated in the spec. bge models are trained asymmetrically: queries require a specific instruction prefix (`"Represent this sentence for searching relevant passages: "`) prepended before embedding, while passages (chunks) are embedded plain. This is a real, non-obvious detail — getting it backwards doesn't error, it just silently produces worse retrieval with no diagnostic signal that anything is wrong.
+
+**Trade-off accepted:** Slightly more implementation care required than MiniLM (the asymmetric prefix logic), in exchange for measurably better retrieval quality on the benchmark this model was evaluated against. Enforced this correctness structurally by splitting `embed_passages()` and `embed_query()` into two separate functions, where only the query function has access to the prefix constant — makes it hard to accidentally apply the prefix in the wrong place.
+
+**Interview angle:** *"I chose bge-small over the more commonly-tutorialed MiniLM because it scores higher on retrieval-specific benchmarks while still being small enough to run on CPU with no GPU cost. The real engineering detail worth mentioning is that bge is trained asymmetrically — queries and passages need to be embedded differently, with a specific instruction prefix only on the query side. That's not enforced by the library; I enforced it by splitting my embedding code into two functions so it's structurally hard to mix them up."*
+
+---
+
+## Vector Store Selection: Chroma over Qdrant/Pinecone
+**Phase:** B1
+**Date:** 28-07-2026
+
+**Options considered:** Qdrant (self-hosted) vs Pinecone (managed cloud) vs Chroma (self-hosted)
+
+**Chosen:** Chroma, self-hosted via Docker Compose (`chromadb/chroma:0.5.20`)
+
+**Why:** Qdrant's real advantages — RBAC, horizontal scaling — solve problems this project's data volume never actually hits; adopting it would mean operating infrastructure whose benefits are never exercised. Pinecone is a paid external dependency that adds a network round-trip and a failure mode (API availability during a demo) for zero benefit at this scale, and contradicts the project's "no API cost, everything runs locally" principle already established for embeddings. Chroma bolts onto the existing `docker-compose.yml` with a single new service block and integrates with metadata filtering sufficient for B1-B3's actual needs.
+
+**Trade-off accepted:** Chroma is less battle-tested at production scale than Qdrant, and lacks Qdrant's RBAC/clustering — a legitimate limitation to name explicitly if asked "would you use this in production," rather than implying Chroma was chosen for anything other than fit-for-scale.
+
+**Interview angle:** *"I picked Chroma over Qdrant and Pinecone because the advantages of the more 'production-grade' options — Qdrant's RBAC and horizontal scaling, Pinecone's managed infrastructure — solve problems I don't actually have at this project's scale. Pinecone specifically would have added a paid external dependency and a network failure mode for no real benefit. I'd revisit this decision if this system needed to scale to millions of vectors or multiple operators — but building for that now would be complexity theater."*
+
+---
+
+## Separate `embedding_processing` RQ Queue, Single Worker Process
+**Phase:** B1
+**Date:** 28-07-2026
+
+**Options considered:** (a) Embed inside the same job as chunking (`process_document_version_job`) vs (b) a separate downstream job on its own named queue. Also: one worker process listening to both queues vs two separate worker processes.
+
+**Chosen:** (b) — separate `embedding_processing` queue, chunking job chains into it on success. One worker process (`run_worker.py`) listens to both `document_processing` and `embedding_processing`.
+
+**Why:** Chunking is fast, deterministic, pure-CPU text work; embedding is a heavier, separate concern (model inference, more failure surface). Bundling them into one job means a transient embedding failure fails the entire ingestion, including chunking work that already succeeded — retrying would redo already-correct work. A separate queue lets embedding be retried independently. This queue was explicitly anticipated back in A3's decision log ("a named queue was used instead of RQ's default queue, anticipating future job types like embeddings"), so this is that anticipated moment, not new scope. Two separate worker *processes* were rejected as infrastructure complexity with no payoff at this project's actual concurrency (solo developer, one document at a time) — one worker consuming both queues is simpler to run and monitor, and can be split later if one queue ever starves the other.
+
+**Trade-off accepted:** No dedicated status column (e.g. `embed_status`) exists on `DocumentVersion` or `Chunk` to track embedding success/failure the way `parse_status` tracks parsing — embedding failures currently surface only via RQ's own failure registry, not a queryable app-level field. Deliberately deferred rather than added reflexively; would need its own migration and design pass if the project later needs to *display* embedding status to a user, rather than just debug it via RQ.
+
+**Interview angle:** *"I split embedding into its own RQ queue and job, chained off the successful completion of the existing chunking job, rather than doing both in one job — a transient failure in embedding shouldn't force re-doing chunking work that already succeeded. I deliberately kept it to one worker process consuming both queues rather than running two separate worker processes, since splitting them would be solving a scaling problem I don't actually have yet at this project's volume."*
+
+---
+
+## Single Chroma Collection with Metadata Filtering, Not Collection-Per-Tenant
+**Phase:** B1
+**Date:** 28-07-2026
+
+**Options considered:** One Chroma collection per organization (tenant) vs a single shared collection (`contract_chunks`) with `org_id`/`document_id`/`document_version_id`/`is_current` stored as metadata on every vector, filtered at query time
+
+**Chosen:** Single shared collection, metadata-filtered queries
+
+**Why:** Collection-per-tenant means collection lifecycle management scales with organization count — creation, cleanup, and enumeration all become tenant-count-dependent operations. A single collection with metadata filtering avoids that entirely and is simpler to reason about and operate at this project's scale. Chroma's `where` clause supports compound filtering (`$and` across `org_id`, `document_id`, `is_current`) sufficiently for B1-B3's retrieval needs.
+
+**Trade-off accepted:** A bug in metadata-filter construction is a more severe failure mode than in collection-per-tenant (where physical separation is the isolation boundary) — a malformed filter here could theoretically return cross-tenant results directly from Chroma. This is exactly why the `query()` function in `vector_store.py` is designed to return chunk IDs only, never content — see the next entry.
+
+**Interview angle:** *"I used one shared Chroma collection with tenant/document metadata on every vector, rather than a collection per organization, because collection-per-tenant makes collection lifecycle scale with tenant count for no real isolation benefit at this project's scale. The trade-off is that isolation now depends on filter correctness rather than physical separation — which is exactly why I didn't stop at the Chroma layer for tenant isolation; Postgres is still the actual enforced boundary."*
+
+---
+
+## Vector Store as Untrusted Index, Postgres as the Real Tenant-Isolation Boundary
+**Phase:** B1
+**Date:** 28-07-2026
+
+**Options considered:** Trust Chroma's metadata filter as the tenant-isolation boundary vs. treat it as a performance/relevance optimization only, with Postgres's existing tenant-scoped `ChunkRepository` as the actual enforced gate
+
+**Chosen:** Chroma's `query()` function (`app/services/vector_store.py`) returns chunk ID strings only — never chunk content. Callers are structurally required to take those IDs to the existing tenant-scoped `ChunkRepository` to retrieve actual content.
+
+**Why:** This directly mirrors the A2 decision to make the repository layer, not any individual query, the enforced tenant-isolation boundary, and the A4 decision to never fully trust a JWT's claims without re-verifying against the database. Chroma's metadata filter is real and useful for narrowing candidates and improving relevance, but it's an index, not an authorization system — a future bug in filter construction (a missing `org_id`, a typo) would otherwise become a direct cross-tenant data leak with no second check. By returning IDs only, any such bug is caught downstream by the repository's own `org_id` filter — the same mechanism your A2 isolation script already proved cannot return another tenant's data.
+
+**Trade-off accepted:** An extra Postgres round-trip after every vector query (fetch chunk IDs from Chroma, then fetch actual content from Postgres by ID) instead of returning content directly from Chroma — a deliberate latency-for-correctness trade, same reasoning as A4's "re-query the DB every request" decision for `get_current_user`.
+
+**Interview angle:** *"I designed my vector store wrapper to only ever return chunk IDs, never chunk content — so whatever calls it is structurally forced to go through my existing tenant-scoped repository to actually fetch data. That means even if I ever get the Chroma metadata filter wrong, the worst case is a query that returns nothing, not a query that leaks another tenant's contract text. It's the same principle as re-checking a JWT's claims against the database instead of trusting them blindly — don't let a single point of filtering be the only thing standing between a bug and a real data leak."*
+
+---
+
+## Bug: sentence-transformers Pulled GPU-Enabled Torch by Default, Exhausting Disk via CUDA Dependencies
+**Phase:** B1
+**Date:** 28-07-2026
+
+**What was found:** `pip install -r requirements.txt` failed with `OSError: [Errno 28] No space left on device` partway through installing `sentence-transformers`. Root cause: `sentence-transformers` pulled in the default (GPU/CUDA-enabled) build of PyTorch as a transitive dependency, which in turn pulled a full NVIDIA CUDA toolkit — `nvidia-cublas` (423MB), `nvidia-cudnn-cu13` (366MB), `nvidia-nccl-cu13` (206MB), `triton` (197MB), `nvidia-cusparselt-cu13` (170MB), plus `torch` itself (526MB) — over 1.8GB of GPU libraries the project has no use for, since this WSL2 dev environment has no GPU passthrough configured.
+
+**Fix:** Installed the CPU-only PyTorch build explicitly, before running the main install, using PyTorch's own package index: `pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu`. This satisfied `sentence-transformers`' torch dependency with the already-installed CPU build (192MB vs. the 526MB+1.8GB GPU variant), so re-running `pip install -r requirements.txt` never attempted to pull the CUDA stack at all.
+
+**Why this matters:** This isn't just a disk-space workaround — it's the objectively correct dependency for this environment. The GPU build of torch is pure overhead for CPU-only inference; explicitly pinning the CPU build is a real, defensible engineering choice independent of the disk issue that surfaced it.
+
+**Interview angle:** *"My dependency install failed with a disk-space error, and the actual root cause was that sentence-transformers was silently pulling in the GPU-enabled build of PyTorch — over 1.8GB of CUDA libraries — on a machine with no GPU to use them. The fix wasn't just freeing disk space; it was installing the CPU-only torch build explicitly, from PyTorch's own package index, before the main install ran. That's the objectively correct dependency for this environment regardless of the disk issue — I'd have wanted it that way even with unlimited disk space, since there's no reason to ship 1.8GB of unused GPU code."*
+
+---
+
+## Bug: WSL2's `/tmp` tmpfs Ceiling (1.8G) Silently Capped pip Installs Despite 952G Free on Disk
+**Phase:** B1
+**Date:** 28-07-2026
+
+**What was found:** After fixing the CUDA-dependency issue above, the same `OSError: [Errno 28] No space left on device` recurred on a retry, despite `df -h /` showing 952G available on the actual filesystem. Root cause, found by checking `df -h /tmp` specifically: WSL2 mounts `/tmp` as `tmpfs` — a RAM-backed filesystem, capped at 1.8G, entirely separate from the 952G root filesystem. pip downloads wheel files into `/tmp` before installing them; several multi-hundred-MB downloads in flight simultaneously exhausted the 1.8G tmpfs ceiling, a limit invisible to `df -h /` because it's a different mount point.
+
+**Fix:** Redirected pip's temp directory to the regular (non-tmpfs) filesystem for the session: `export TMPDIR=/home/nithin/pip_tmp` (with the directory created first via `mkdir -p`). Combined with the CPU-only torch fix above, the subsequent install completed without error.
+
+**Why this matters:** `df -h /` reporting hundreds of gigabytes free was actively misleading about the real constraint — a classic case of checking the wrong metric and trusting a plausible-looking number instead of verifying the specific failure point. The fix required understanding WSL2's mount architecture (tmpfs vs. the main ext4 filesystem), not just retrying or clearing generic caches.
+
+**Interview angle:** *"I hit a disk-space error that made no sense — my filesystem showed 952 gigabytes free, but the install kept failing with 'no space left on device.' The actual constraint was a completely different, much smaller filesystem: WSL2 mounts /tmp as a RAM-backed tmpfs capped at 1.8 gigabytes, invisible to a plain 'df -h /' check on the root filesystem. I found it by checking /tmp specifically instead of assuming the first plausible number I saw was the real bottleneck, then fixed it by redirecting pip's temp directory to the regular filesystem."*
