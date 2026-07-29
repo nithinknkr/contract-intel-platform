@@ -1100,3 +1100,18 @@ Why: documents.search_vector indexes filenames for document-level search (A4) �
 Trade-off accepted: None material — straightforward, low-risk addition following an already-proven pattern.
 
 Interview angle: "I added a second generated tsvector column, separate from my document-search one, because they serve different retrieval surfaces — one indexes filenames for document lookup, the other indexes chunk content for BM25 in the RAG pipeline. Alembic's autogenerate still can't detect generated-column expressions, exactly like I'd already seen with the filename-search fix, so I hand-wrote this one too rather than trusting a blind autogenerate."
+
+
+## LLM Provider & Model Selection: Groq (openai/gpt-oss-120b) over Gemini
+## Phase: B2
+## Date: 29-07-2026
+
+Options considered: Gemini free tier vs Groq free tier (per spec, either was acceptable); within Groq, llama-3.3-70b-versatile vs qwen/qwen3.6-27b vs openai/gpt-oss-20b vs openai/gpt-oss-120b
+
+Chosen: Groq, model openai/gpt-oss-120b
+
+Why: Groq's tighter free-tier rate limits make B7's resilience work (backoff, circuit breaker, graceful degradation) genuinely necessary rather than theoretical — a more honest interview story than building resilience code around a provider that rarely actually throttles you. Within Groq's lineup, only gpt-oss-20b/120b/safeguard-20b expose structured_outputs as a supported feature (vs. weaker json_mode-only support on Llama 3.3 70B and Qwen3.6); structured_outputs gives schema-enforced citation JSON, which B3's citation verification depends on being reliable. Ruled out safeguard-20b (a safety-classifier variant, not general-purpose). Chose 120B over 20B for stronger instruction-following on "only cite chunks you were actually given" — a reasoning-adjacent task where the larger model matters more than raw speed, and pricing is negligible at this project's volume either way.
+
+Trade-off accepted: Groq's rate limits are real and will surface during dev/demo — explicitly the point, deferred handling to B7 rather than building ad-hoc retry logic now. 120B is slower and costs more per token than 20B, though both are trivially cheap at this scale.
+
+Interview angle: "I picked Groq over Gemini specifically because its tighter rate limits would force me to build real resilience later in B7, rather than have that phase be theoretical. Within Groq's model lineup, I filtered to models that support structured outputs — not just JSON mode — because my citation-verification layer needs schema-enforced JSON, not best-effort JSON. I went with the 120B parameter model over the smaller 20B because citation discipline is an instruction-following task where model size actually matters, and at Groq's pricing the cost difference is negligible."

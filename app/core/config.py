@@ -20,5 +20,13 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 14
 
+    # --- RAG Retrieval / LLM (added in B2) ---
+    groq_api_key: str
+    groq_model: str = "openai/gpt-oss-120b"
+    top_k_vector: int = 15
+    top_k_bm25: int = 15
+    top_k_fused: int = 5
+    rrf_k: int = 60
+
 
 settings = Settings()
