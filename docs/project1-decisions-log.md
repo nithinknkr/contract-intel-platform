@@ -1084,3 +1084,19 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Why this matters:** `df -h /` reporting hundreds of gigabytes free was actively misleading about the real constraint — a classic case of checking the wrong metric and trusting a plausible-looking number instead of verifying the specific failure point. The fix required understanding WSL2's mount architecture (tmpfs vs. the main ext4 filesystem), not just retrying or clearing generic caches.
 
 **Interview angle:** *"I hit a disk-space error that made no sense — my filesystem showed 952 gigabytes free, but the install kept failing with 'no space left on device.' The actual constraint was a completely different, much smaller filesystem: WSL2 mounts /tmp as a RAM-backed tmpfs capped at 1.8 gigabytes, invisible to a plain 'df -h /' check on the root filesystem. I found it by checking /tmp specifically instead of assuming the first plausible number I saw was the real bottleneck, then fixed it by redirecting pip's temp directory to the regular filesystem."*
+
+
+
+## Phase: B2
+# Chunks.content_tsvector — New Column for Hybrid Retrieval BM25
+## Date: 29-07-2026
+
+Options considered: Reuse/extend documents.search_vector (A4) vs. add a new, separate generated column on chunks.content
+
+Chosen: New chunks.content_tsvector generated column (to_tsvector('english', content)), own GIN index, hand-written migration (autogenerate produced an empty diff, consistent with the A4 precedent for generated-column expressions)
+
+Why: documents.search_vector indexes filenames for document-level search (A4) — an entirely different retrieval surface from BM25 over chunk content for RAG. No stripping/normalization needed here (unlike A4's filename fix), since chunk content is prose, not word.extension patterns.
+
+Trade-off accepted: None material — straightforward, low-risk addition following an already-proven pattern.
+
+Interview angle: "I added a second generated tsvector column, separate from my document-search one, because they serve different retrieval surfaces — one indexes filenames for document lookup, the other indexes chunk content for BM25 in the RAG pipeline. Alembic's autogenerate still can't detect generated-column expressions, exactly like I'd already seen with the filename-search fix, so I hand-wrote this one too rather than trusting a blind autogenerate."
