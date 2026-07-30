@@ -4,7 +4,6 @@ import uuid
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.core.deps import get_current_org_id, require_role
 from app.db.session import get_db
 from app.models.document import Document, DocumentStatus
 from app.models.document_version import DocumentVersion, ParseStatus
@@ -22,6 +21,12 @@ from app.schemas.document import (
 from app.services.jobs import process_document_version_job
 from app.services.queue import document_queue
 from app.services.storage import LocalStorageClient
+
+
+from app.core.deps import get_current_org_id, get_current_user, require_role
+from app.schemas.qa import AskRequest, AskResponse, CitationOut
+from app.services.llm import LLMServiceError, ask_llm
+from app.services.retrieval import get_context_chunks
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -238,3 +243,70 @@ def archive_document(
 
     db.commit()
     return None
+@router.post("/{document_id}/ask", response_model=AskResponse)
+def ask_document(
+    document_id: uuid.UUID,
+    body: AskRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Grounded Q&A over a single document, via hybrid (BM25 + vector) retrieval
+    fused with RRF, answered by an LLM constrained to structured JSON output.
+    No role restriction beyond authentication -- this is a read action, and
+    per A2's least-privilege role model a viewer should be able to ask
+    questions on documents they can already see.
+    """
+    org_id = current_user.org_id
+
+    doc_repo = DocumentRepository(db)
+    document = doc_repo.get_by_id(org_id, document_id)
+    if document is None:
+        # 404, not 403 -- same cross-tenant existence-hiding pattern as
+        # get_document above.
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if document.is_archived:
+        # Archived-ness is a request-validity concern, checked here at the
+        # endpoint boundary -- not baked into the retrieval query itself.
+        # See B2 decisions log.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot ask questions of an archived document",
+        )
+
+    chunks = get_context_chunks(db, org_id, document_id, body.question)
+
+    if not chunks:
+        # No retrieval hits at all -- don't call the LLM with an empty
+        # context, that's a wasted call guaranteed to produce a useless
+        # or hallucinated answer. Return a clean, honest "nothing found."
+        return AskResponse(
+            answer="No relevant content was found in this document to answer the question.",
+            citations=[],
+            retrieved_chunk_ids=[],
+        )
+
+    try:
+        llm_answer = ask_llm(body.question, chunks)
+    except LLMServiceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"LLM service error: {exc}",
+        )
+
+    AuditLogRepository(db).create(
+        org_id=org_id,
+        action="document.asked",
+        resource_type="document",
+        resource_id=document_id,
+        user_id=current_user.id,
+        event_metadata={"question": body.question},
+    )
+    db.commit()
+
+    return AskResponse(
+        answer=llm_answer.answer,
+        citations=[CitationOut(chunk_id=c.chunk_id, quote=c.quote) for c in llm_answer.citations],
+        retrieved_chunk_ids=[chunk.id for chunk in chunks],
+    )
