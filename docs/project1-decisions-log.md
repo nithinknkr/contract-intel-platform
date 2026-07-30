@@ -1085,33 +1085,120 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 
 **Interview angle:** *"I hit a disk-space error that made no sense — my filesystem showed 952 gigabytes free, but the install kept failing with 'no space left on device.' The actual constraint was a completely different, much smaller filesystem: WSL2 mounts /tmp as a RAM-backed tmpfs capped at 1.8 gigabytes, invisible to a plain 'df -h /' check on the root filesystem. I found it by checking /tmp specifically instead of assuming the first plausible number I saw was the real bottleneck, then fixed it by redirecting pip's temp directory to the regular filesystem."*
 
+# Phase B2 Decisions
 
+---
 
-## Phase: B2
-# Chunks.content_tsvector — New Column for Hybrid Retrieval BM25
-## Date: 29-07-2026
+## `chunks.content_tsvector` — New Column for Hybrid Retrieval BM25
+**Phase:** B2
+**Date:** 29-07-2026
 
-Options considered: Reuse/extend documents.search_vector (A4) vs. add a new, separate generated column on chunks.content
+**Options considered:** Reuse/extend `documents.search_vector` (A4) vs. add a new, separate generated column on `chunks.content`
 
-Chosen: New chunks.content_tsvector generated column (to_tsvector('english', content)), own GIN index, hand-written migration (autogenerate produced an empty diff, consistent with the A4 precedent for generated-column expressions)
+**Chosen:** New `chunks.content_tsvector` generated column (`to_tsvector('english', content)`), own GIN index, hand-written migration (autogenerate produced an empty diff, consistent with the A4 precedent for generated-column expressions)
 
-Why: documents.search_vector indexes filenames for document-level search (A4) — an entirely different retrieval surface from BM25 over chunk content for RAG. No stripping/normalization needed here (unlike A4's filename fix), since chunk content is prose, not word.extension patterns.
+**Why:** `documents.search_vector` indexes filenames for document-level search (A4) — an entirely different retrieval surface from BM25 over chunk content for RAG. No stripping/normalization needed here (unlike A4's filename fix), since chunk content is prose, not `word.extension` patterns.
 
-Trade-off accepted: None material — straightforward, low-risk addition following an already-proven pattern.
+**Trade-off accepted:** None material — straightforward, low-risk addition following an already-proven pattern.
 
-Interview angle: "I added a second generated tsvector column, separate from my document-search one, because they serve different retrieval surfaces — one indexes filenames for document lookup, the other indexes chunk content for BM25 in the RAG pipeline. Alembic's autogenerate still can't detect generated-column expressions, exactly like I'd already seen with the filename-search fix, so I hand-wrote this one too rather than trusting a blind autogenerate."
+**Interview angle:** *"I added a second generated tsvector column, separate from my document-search one, because they serve different retrieval surfaces — one indexes filenames for document lookup, the other indexes chunk content for BM25 in the RAG pipeline. Alembic's autogenerate still can't detect generated-column expressions, exactly like I'd already seen with the filename-search fix, so I hand-wrote this one too rather than trusting a blind autogenerate."*
 
+---
 
-## LLM Provider & Model Selection: Groq (openai/gpt-oss-120b) over Gemini
-## Phase: B2
-## Date: 29-07-2026
+## LLM Provider & Model Selection: Groq (`openai/gpt-oss-120b`) over Gemini
+**Phase:** B2
+**Date:** 29-07-2026
 
-Options considered: Gemini free tier vs Groq free tier (per spec, either was acceptable); within Groq, llama-3.3-70b-versatile vs qwen/qwen3.6-27b vs openai/gpt-oss-20b vs openai/gpt-oss-120b
+**Options considered:** Gemini free tier vs Groq free tier (per spec, either was acceptable); within Groq, `llama-3.3-70b-versatile` vs `qwen/qwen3.6-27b` vs `openai/gpt-oss-20b` vs `openai/gpt-oss-120b`
 
-Chosen: Groq, model openai/gpt-oss-120b
+**Chosen:** Groq, model `openai/gpt-oss-120b`
 
-Why: Groq's tighter free-tier rate limits make B7's resilience work (backoff, circuit breaker, graceful degradation) genuinely necessary rather than theoretical — a more honest interview story than building resilience code around a provider that rarely actually throttles you. Within Groq's lineup, only gpt-oss-20b/120b/safeguard-20b expose structured_outputs as a supported feature (vs. weaker json_mode-only support on Llama 3.3 70B and Qwen3.6); structured_outputs gives schema-enforced citation JSON, which B3's citation verification depends on being reliable. Ruled out safeguard-20b (a safety-classifier variant, not general-purpose). Chose 120B over 20B for stronger instruction-following on "only cite chunks you were actually given" — a reasoning-adjacent task where the larger model matters more than raw speed, and pricing is negligible at this project's volume either way.
+**Why:** Groq's tighter free-tier rate limits make B7's resilience work (backoff, circuit breaker, graceful degradation) genuinely necessary rather than theoretical — a more honest interview story than building resilience code around a provider that rarely actually throttles you. Within Groq's lineup, only `gpt-oss-20b`/`120b`/`safeguard-20b` expose `structured_outputs` as a supported feature (vs. weaker `json_mode`-only support on Llama 3.3 70B and Qwen3.6); `structured_outputs` gives schema-enforced citation JSON, which B3's citation verification depends on being reliable. Ruled out `safeguard-20b` (a safety-classifier variant, not general-purpose). Chose 120B over 20B for stronger instruction-following on "only cite chunks you were actually given" — a reasoning-adjacent task where the larger model matters more than raw speed, and pricing is negligible at this project's volume either way.
 
-Trade-off accepted: Groq's rate limits are real and will surface during dev/demo — explicitly the point, deferred handling to B7 rather than building ad-hoc retry logic now. 120B is slower and costs more per token than 20B, though both are trivially cheap at this scale.
+**Trade-off accepted:** Groq's rate limits are real and will surface during dev/demo — explicitly the point, deferred handling to B7 rather than building ad-hoc retry logic now. 120B is slower and costs more per token than 20B, though both are trivially cheap at this scale.
 
-Interview angle: "I picked Groq over Gemini specifically because its tighter rate limits would force me to build real resilience later in B7, rather than have that phase be theoretical. Within Groq's model lineup, I filtered to models that support structured outputs — not just JSON mode — because my citation-verification layer needs schema-enforced JSON, not best-effort JSON. I went with the 120B parameter model over the smaller 20B because citation discipline is an instruction-following task where model size actually matters, and at Groq's pricing the cost difference is negligible."
+**Interview angle:** *"I picked Groq over Gemini specifically because its tighter rate limits would force me to build real resilience later in B7, rather than have that phase be theoretical. Within Groq's model lineup, I filtered to models that support structured outputs — not just JSON mode — because my citation-verification layer needs schema-enforced JSON, not best-effort JSON. I went with the 120B parameter model over the smaller 20B because citation discipline is an instruction-following task where model size actually matters, and at Groq's pricing the cost difference is negligible."*
+
+---
+
+## Hybrid Retrieval Fusion: Reciprocal Rank Fusion (RRF) over Weighted Score Blend
+**Phase:** B2
+**Date:** 29-07-2026
+
+**Options considered:** Hand-tuned weighted blend of vector cosine-similarity score and Postgres `ts_rank` score vs. Reciprocal Rank Fusion (rank-based, not score-based)
+
+**Chosen:** RRF, `k=60` (the standard constant from Cormack et al., 2009 — not project-tuned), fusing the top-15 candidates from each retrieval method down to a top-5 fused set
+
+**Why:** Cosine similarity and `ts_rank` live on incomparable scales — there's no principled way to weight them against each other without an arbitrary, hard-to-defend constant. RRF sidesteps the scale problem entirely by fusing on rank position rather than raw score, which is both simpler to implement and easier to explain and defend in an interview than a hand-tuned blend.
+
+**Trade-off accepted:** `top_k_vector=15`, `top_k_bm25=15`, `top_k_fused=5` are unvalidated starting defaults, stored as config (not hardcoded), explicitly flagged for revisiting once B6's eval harness exists — same pattern as A3's char/overlap chunk-size decision.
+
+**Interview angle:** *"I used Reciprocal Rank Fusion instead of a weighted blend because cosine similarity and BM25's ts_rank aren't on comparable scales — any weighting between them would be an arbitrary knob I couldn't really defend. RRF fuses on rank position instead of raw score, using the standard k=60 constant from the original paper rather than inventing my own. My top-k values are explicit config defaults, not hardcoded, because I expect to revisit them once I have an actual eval harness in B6 to tune against."*
+
+---
+
+## Citation Format: Structured JSON Output over Regex-Parsed Inline Citations
+**Phase:** B2
+**Date:** 29-07-2026
+
+**Options considered:** LLM outputs prose with inline chunk UUIDs, parsed via regex vs. Groq's `structured_outputs` (JSON-schema-enforced) response, parsed directly into a Pydantic model
+
+**Chosen:** Structured JSON — `{"answer": str, "citations": [{"chunk_id": str, "quote": str}]}`, enforced via Groq's `response_format={"type": "json_schema", ...}` and validated through a Pydantic `LLMAnswer` model
+
+**Why:** B3's citation verification needs to programmatically check "was this chunk_id actually in the retrieved set" — trivial against structured JSON, fragile and error-prone against regex-scraped prose. Building this correctly from B2 onward means B3 doesn't require reworking the LLM integration layer, only adding a stricter verification step on top of data that's already in the right shape.
+
+**Trade-off accepted:** Slightly more implementation complexity upfront (schema definition, response parsing/validation) versus a simpler prompt-and-hope approach — justified since B3 depends on this foundation being solid.
+
+**Interview angle:** *"I built structured JSON citation output from the start, using Groq's schema-enforced structured outputs mode rather than parsing citations out of free text with regex. That decision was made specifically with B3 in mind — citation verification needs reliable, structured chunk_id references to check against the retrieved set, and I didn't want to have to rebuild the LLM integration layer once I got to that phase."*
+
+---
+
+## Prompt Delimiting: Data/Instruction Separation Built in from B2, Not Deferred to B5
+**Phase:** B2
+**Date:** 29-07-2026
+
+**Options considered:** Write a simple, undelimited prompt now and add injection-defense delimiting later in B5 vs. build clear data/instruction delimiting into the prompt template from the start
+
+**Chosen:** Retrieved chunk content wrapped in `<chunk id="...">...</chunk>` tags, with an explicit system-prompt instruction that content inside those tags is untrusted document data, never instructions to follow — including a concrete example of what an injected instruction might look like.
+
+**Why:** B5 is scoped to *test and harden* prompt injection defense, not invent delimiting from scratch at that point — building the scaffolding now means B5 becomes a real red-team/hardening exercise against an existing design, rather than a first draft. The system prompt names a concrete example pattern ("ignore previous instructions") to give the model a real anchor rather than a purely abstract instruction.
+
+**Trade-off accepted:** No actual injection testing has been done yet (that's genuinely B5's job) — this is unverified defensive scaffolding, not a proven defense. Also: no prompt-length/token-budget guard exists yet if retrieval ever returned unusually large chunks.
+
+**Interview angle:** *"I built prompt delimiting — wrapping retrieved content in tags and explicitly telling the model that content is data, not instructions — from B2 onward, even though prompt injection testing itself is scoped to B5. That way B5 becomes a real hardening and red-teaming exercise against an existing design, not something built from scratch under time pressure once I got there."*
+
+---
+
+## Bug: `chunks.content_tsvector` DB Column Existed but Was Never Mapped on the SQLAlchemy Model
+**Phase:** B2
+**Date:** 30-07-2026
+
+**What was found:** The B2 migration correctly added `content_tsvector` to the Postgres `chunks` table, but the corresponding field was never added to the `Chunk` SQLAlchemy model — an oversight during initial review, not caught until `ChunkRepository.get_bm25_matches` referenced `Chunk.content_tsvector` at runtime and raised `AttributeError: type object 'Chunk' has no attribute 'content_tsvector'`.
+
+**Fix:** Added `content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)` to the model — deliberately plain `mapped_column`, not wrapped in `sa.Computed(...)`, since the generated-column DDL already exists in Postgres via the hand-written migration; the model only needs read access, not DDL-authoring responsibility.
+
+**Why this matters:** A close cousin of A3's `NoReferencedTableError` bug — SQLAlchemy only knows about what's explicitly declared on the model, regardless of what actually exists in the database. A hand-written migration adding a column doesn't retroactively update the ORM model; that's a separate, manual step that has to be remembered every time.
+
+**Interview angle:** *"I hit a variant of a bug I'd already seen once in A3 — SQLAlchemy's model layer and the actual database schema can silently drift, because a hand-written migration doesn't automatically update the ORM model. I caught it via a real runtime AttributeError during manual testing, not during code review, which is itself worth noting: this is the kind of gap that passes a migration review cleanly but only surfaces the first time you actually query the column."*
+
+---
+
+## Manual Testing Finding: Citation Quality on Negative Answers Is Weaker
+**Phase:** B2
+**Date:** 30-07-2026
+
+**What was found:** During manual testing, asking a question with no answer in the document (a non-compete clause, absent from the test contract) correctly produced a truthful "not found" answer — no fabricated clause was invented. However, the citations attached to that negative answer quoted section-header fragments (e.g., "3. SCOPE OF SERVICES ... 4. CLIENT OBLIGATIONS ...") rather than genuine supporting text, since there's no real excerpt that can "prove" an absence. `ask_llm`'s current sanity check only verifies a cited chunk_id was part of the retrieved context — it does not verify the `quote` field is an accurate excerpt of that chunk's actual content.
+
+**Why this matters:** This is empirical evidence, not a hypothetical concern, for why B3's citation verification needs to check quote-to-content grounding, not just chunk_id membership. The model didn't hallucinate false facts here, but its citation behavior degrades in a specific, identifiable way on negative answers — a real finding worth having discovered before B3, not during it.
+
+**Interview angle:** *"During B2 manual testing I found that my LLM correctly avoided fabricating a clause that didn't exist in the contract, but its citations for that 'not found' answer were weak — quoting section headers instead of real supporting text, since there's nothing genuine to quote for an absence. That's a concrete, observed failure mode, not a theoretical one, and it's exactly what B3's citation verification needs to catch: checking that a quote actually appears in its cited chunk, not just that the chunk_id was legitimately retrieved."*
+
+---
+
+## B2 Final State
+**Phase:** B2
+**Date:** 30-07-2026
+
+**Summary:** `POST /documents/{document_id}/ask` implemented end to end: hybrid retrieval (BM25 via Postgres full-text search + vector similarity via Chroma) fused with Reciprocal Rank Fusion, answered by Groq (`openai/gpt-oss-120b`) with schema-enforced structured JSON output, citation chunk_ids sanity-checked against the retrieved set before returning. Archived-document guard, tenant isolation, and audit logging (`document.asked`) all verified. Manually tested end-to-end against a real (synthetically generated, non-copyrighted) contract: accurate grounded answers with correct citations on positive questions, correct refusal on out-of-scope questions, and one real bug plus one real citation-quality gap found and documented — both directly informing B3's scope.
+
+**Interview angle:** *"By the end of B2 I had a working grounded Q&A endpoint that I didn't just build and assume was correct — I tested it against a real contract with known answers, a deliberate hallucination canary, and an archived-document edge case. That testing surfaced a real bug (a missing ORM mapping) and a real citation-quality gap on negative answers, both of which I fixed or documented rather than only discovering once B3 was already underway."*
