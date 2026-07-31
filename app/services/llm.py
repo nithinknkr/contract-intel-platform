@@ -107,15 +107,10 @@ def ask_llm(question: str, chunks: list) -> LLMAnswer:
             f"Groq response did not match expected schema: {exc}"
         ) from exc
 
-    # Sanity check the model actually followed Rule 4 (never invent a
-    # chunk_id) -- prompt-level instruction only, not enforced by the
-    # schema itself. Full citation verification against the retrieved
-    # set is B3's job; this is a cheap pre-check, not a replacement.
-    valid_chunk_ids = {str(chunk.id) for chunk in chunks}
-    for citation in parsed.citations:
-        if citation.chunk_id not in valid_chunk_ids:
-            raise LLMServiceError(
-                f"LLM cited chunk_id {citation.chunk_id} not present in retrieved context"
-            )
-
+    # Citation verification (chunk_id membership + quote grounding) is
+    # B3's job -- see app/services/citation_verifier.py. Deliberately not
+    # done here: a single bad citation shouldn't raise and abort the
+    # whole request with a 502, it should be caught and dropped
+    # downstream, non-fatally, so an otherwise-correct answer can still
+    # be returned.
     return parsed

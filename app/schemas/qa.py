@@ -16,3 +16,4 @@ class AskResponse(BaseModel):
     answer: str
     citations: list[CitationOut]
     retrieved_chunk_ids: list[uuid.UUID]
+    all_citations_verified: bool

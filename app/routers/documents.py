@@ -21,6 +21,7 @@ from app.schemas.document import (
 from app.services.jobs import process_document_version_job
 from app.services.queue import document_queue
 from app.services.storage import LocalStorageClient
+from app.services.citation_verifier import verify_citations
 
 
 from app.core.deps import get_current_org_id, get_current_user, require_role
@@ -295,6 +296,8 @@ def ask_document(
             detail=f"LLM service error: {exc}",
         )
 
+    verification = verify_citations(llm_answer.citations, chunks)
+
     AuditLogRepository(db).create(
         org_id=org_id,
         action="document.asked",
@@ -303,10 +306,35 @@ def ask_document(
         user_id=current_user.id,
         event_metadata={"question": body.question},
     )
+
+    if not verification.all_citations_verified:
+        # Only failed citations are logged, not full quotes/content --
+        # enough to debug (which chunk, which failure mode) without
+        # writing large amounts of contract text into the audit trail.
+        AuditLogRepository(db).create(
+            org_id=org_id,
+            action="document.citation_verification_failed",
+            resource_type="document",
+            resource_id=document_id,
+            user_id=current_user.id,
+            event_metadata={
+                "question": body.question,
+                "failed_citations": [
+                    {"chunk_id": c.chunk_id, "failure_reason": c.failure_reason}
+                    for c in verification.citations
+                    if not c.verified
+                ],
+            },
+        )
+
     db.commit()
 
     return AskResponse(
         answer=llm_answer.answer,
-        citations=[CitationOut(chunk_id=c.chunk_id, quote=c.quote) for c in llm_answer.citations],
+        citations=[
+            CitationOut(chunk_id=c.chunk_id, quote=c.quote)
+            for c in verification.verified_only
+        ],
         retrieved_chunk_ids=[chunk.id for chunk in chunks],
+        all_citations_verified=verification.all_citations_verified,
     )
