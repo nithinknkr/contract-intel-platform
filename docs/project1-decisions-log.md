@@ -1202,3 +1202,98 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Summary:** `POST /documents/{document_id}/ask` implemented end to end: hybrid retrieval (BM25 via Postgres full-text search + vector similarity via Chroma) fused with Reciprocal Rank Fusion, answered by Groq (`openai/gpt-oss-120b`) with schema-enforced structured JSON output, citation chunk_ids sanity-checked against the retrieved set before returning. Archived-document guard, tenant isolation, and audit logging (`document.asked`) all verified. Manually tested end-to-end against a real (synthetically generated, non-copyrighted) contract: accurate grounded answers with correct citations on positive questions, correct refusal on out-of-scope questions, and one real bug plus one real citation-quality gap found and documented — both directly informing B3's scope.
 
 **Interview angle:** *"By the end of B2 I had a working grounded Q&A endpoint that I didn't just build and assume was correct — I tested it against a real contract with known answers, a deliberate hallucination canary, and an archived-document edge case. That testing surfaced a real bug (a missing ORM mapping) and a real citation-quality gap on negative answers, both of which I fixed or documented rather than only discovering once B3 was already underway."*
+
+
+# Phase B3 Decisions
+
+---
+
+## Citation Verification Scope: Membership + Quote Grounding, Not Just Membership
+**Phase:** B3
+**Date:** 01-08-2026
+
+**Options considered:** Keep B2's existing chunk_id membership check as the entirety of "verification" vs. add a second, independent check for whether the cited quote text is actually grounded in the cited chunk's real content
+
+**Chosen:** Both — membership (was this chunk_id actually retrieved) and grounding (does the quote actually appear in that chunk's content), run as two separate checks per citation
+
+**Why:** B2's own manual testing already found the specific failure mode membership-only checking misses: the LLM citing a real, retrieved chunk_id while quoting fabricated or unrelated text (section-header fragments on a negative "not found" answer, since there's nothing genuine to quote for an absence). A membership-only check would have let that exact case through — it only proves the model didn't invent a chunk_id, not that it didn't invent what that chunk_id supposedly says.
+
+**Trade-off accepted:** None material — grounding checking is cheap (string normalization + substring check), no new dependency, no meaningful latency cost.
+
+**Interview angle:** *"B2's citation check only proved the model didn't invent a chunk_id — it didn't prove the model wasn't citing a real chunk while fabricating what it says. I found that exact gap empirically during B2 testing, on negative answers, so B3's verifier checks both: is the chunk_id real, and does the quoted text actually appear in that chunk's content."*
+
+---
+
+## Grounding Match Strategy: Normalized Substring, Not Exact or Fuzzy
+**Phase:** B3
+**Date:** 01-08-2026
+
+**Options considered:** Exact substring match vs. normalized (lowercase, punctuation-stripped, whitespace-collapsed) substring match vs. fuzzy matching (e.g. rapidfuzz) with a similarity threshold
+
+**Chosen:** Normalized substring match
+
+**Why:** Exact matching would false-fail on genuine quotes constantly — the LLM won't reproduce whitespace, casing, or punctuation perfectly even when accurately quoting real text, making the verifier noisy and untrustworthy. Fuzzy matching would catch more, but adds a new dependency and encroaches on what B6's LLM-as-judge is explicitly meant to do (semantic quality scoring, not grounding verification). Normalization targets the actual observed failure mode — fabricated/unrelated quotes — without over-engineering for a problem (near-miss quoting) that hasn't been observed yet.
+
+**Trade-off accepted:** A quote that's semantically accurate but heavily paraphrased (not a near-verbatim excerpt) would fail this check even though it isn't really "fabricated" — accepted as the correct conservative default; the system prompt already instructs the model to quote, not paraphrase, so a failure here is more likely a genuine grounding problem than a false positive.
+
+**Interview angle:** *"I chose normalized substring matching over exact or fuzzy matching deliberately — exact match is too brittle for real LLM output, and fuzzy matching would overlap with the semantic evaluation work I'm already planning for B6's eval harness. Normalization is the minimum transformation needed to stop false-failing on formatting differences without pulling in a new dependency or blurring the line between 'is this grounded' and 'is this good.'"*
+
+---
+
+## Failed Citations Are Dropped, Not Fatal — Answer Still Returned
+**Phase:** B3
+**Date:** 01-08-2026
+
+**Options considered:** (a) Drop only the failed citation(s), keep the answer text, flag the response as partially/fully unverified. (b) Strip the specific claim tied to a failed citation from the answer text itself. (c) Fail the entire request (as B2's original membership check did) if any citation fails verification.
+
+**Chosen:** (a)
+
+**Why:** (b) would require the LLM to tag which citation supports which specific sentence in the answer — the current schema (`answer: str` + a flat `citations` list) has no such mapping, and building it is a real schema/prompt redesign, not a B3-sized task. (c) is too aggressive: an answer can be substantively correct with one weak citation among several good ones, and B2's original fatal-502 behavior for a single bad chunk_id was itself a bug this phase corrects (see below).
+
+**Trade-off accepted:** A named limitation, not a workaround — the response can't currently indicate *which part* of the answer text lost its citation, only that some citation(s) failed and were dropped. Real per-claim attribution is a genuine future improvement, not implemented here.
+
+**Interview angle:** *"When a citation fails verification, I drop just that citation and keep the answer, rather than failing the whole request or trying to redact the specific claim from the answer text. Redacting per-claim would need the LLM to tag which citation backs which sentence, which my current schema doesn't support — I named that as a real limitation rather than pretending the fix is more complete than it is."*
+
+---
+
+## `ask_llm`'s Fatal Membership Check Removed — Moved to citation_verifier, Made Non-Fatal
+**Phase:** B3
+**Date:** 01-08-2026
+
+**What was found:** B2's `ask_llm` contained a membership sanity-check that, on finding any invalid chunk_id, raised `LLMServiceError` — propagating to a `502` and aborting the entire request, including an otherwise-correct answer. This directly conflicted with B3's non-fatal design (drop-and-flag, not fail-hard) for the exact same failure category.
+
+**Fix:** Removed the fatal check from `ask_llm` entirely. Membership checking is now one of `citation_verifier.verify_citations`'s two checks, non-fatal like grounding.
+
+**Why this matters:** A real, deliberate behavior change — a request that previously 502'd on a single bad citation now returns 200 with that citation dropped and `all_citations_verified=False`. This is a strict improvement (an otherwise-good answer is no longer discarded over one bad citation) but worth naming explicitly as a behavior change, not a silent one.
+
+**Interview angle:** *"My original B2 citation check was fatal — one bad chunk_id killed the whole request with a 502. When I built B3's verifier, I realized that behavior directly contradicted the graceful, non-fatal design I wanted for citation failures generally, so I removed it and folded membership checking into the same non-fatal path as the new grounding check."*
+
+---
+
+## Bug: Test Database Silently Missed a Migration — `alembic` CLI Defaults to Dev DB, Not `.env.test`
+**Phase:** B3
+**Date:** 01-08-2026
+
+**What was found:** `pytest` began failing on `column "content_tsvector" does not exist` against `contract_intel_test`, despite the migration existing and being applied to the dev DB. Root cause: `alembic/env.py` calls `config.set_main_option("sqlalchemy.url", settings.database_url)`, and `settings.database_url` only reflects `.env.test` if something has already called `load_dotenv(".env.test", override=True)` before `app.core.config` is imported — which, per the A5 decision log, only `conftest.py` does. A bare `alembic upgrade head` run from the shell always loads plain `.env` (dev), so the test database's migration history had silently drifted behind dev's.
+
+**Fix:** Ran the migration against the test DB explicitly for this one case: `DATABASE_URL="<test db url>" alembic upgrade head`, overriding the environment variable for that single command.
+
+**Why this matters:** This is the same class of import-time-binding footgun already named in A5 ("Settings/Engine Import-Time Binding") — but that entry only covered the risk *within* a pytest session; it didn't anticipate that a standalone `alembic` CLI invocation has the identical exposure. The test DB can silently fall behind dev with zero error until a test happens to touch the missing column.
+
+**Trade-off accepted:** No structural fix applied yet (e.g. a `Makefile`/script target like `migrate-test` that sets `DATABASE_URL` automatically) — the immediate fix was a one-off manual override. A permanent fix is a good candidate for A6 (CI/CD) or a small standalone script, since this exact mistake is easy to repeat the next time a migration lands.
+
+**Interview angle:** *"I hit the same root cause as an A5 gotcha I'd already documented — settings and the DB engine are bound at import time — but in a place I hadn't anticipated: a bare `alembic` CLI command run outside pytest doesn't get `.env.test` loaded either, so my test database's migration history had silently drifted behind dev's with zero error until a test actually touched the missing column. I fixed it with a one-off environment override and flagged the need for a permanent, harder-to-forget fix."*
+
+---
+
+## Correction to B2 Decision: `content_tsvector` Needed `Computed()`, Not a Plain `mapped_column`
+**Phase:** B3
+**Date:** 01-08-2026
+
+**What was found:** After fixing the migration-drift bug above, a new error appeared: `psycopg2.errors.GeneratedAlways: cannot insert a non-DEFAULT value into column "content_tsvector"`. The B2 decisions log entry ("Bug: `chunks.content_tsvector` DB Column Existed but Was Never Mapped on the SQLAlchemy Model") had deliberately chosen a plain `mapped_column(TSVECTOR, nullable=True)` over `sa.Computed(...)`, reasoning that `Computed()` was only about DDL-authoring responsibility (which migration owns the DDL) — since the migration already existed by hand, the model was assumed to only need read access. That reasoning was incomplete: `Computed()` also controls whether SQLAlchemy's ORM includes a column in `INSERT`/`UPDATE` statements. Without it, every `Chunk` insert explicitly sent `content_tsvector=NULL` in the column list, which Postgres correctly rejects for a `GENERATED ALWAYS ... STORED` column — the earlier fix worked by accident in dev only because dev's migration chain state happened to mask the issue until this phase's test-DB fix surfaced it directly.
+
+**Fix:** Changed the field to `mapped_column(TSVECTOR, Computed("to_tsvector('english'::regconfig, content)", persisted=True), nullable=True)` — the `Computed()` expression string matches the actual migration DDL exactly, so this declares intent to SQLAlchemy without creating or altering anything in the database; Postgres already computes the real value.
+
+**Why this matters:** This is a direct amendment to a previously-logged decision, not a new independent bug — worth stating honestly rather than quietly re-writing history. The original B2 fix correctly diagnosed *that* the model needed to know about this column, but wrong about *which* SQLAlchemy construct correctly expresses "database-computed, don't ever send a value."
+
+**Interview angle:** *"This is a case where I have to correct my own earlier decision, not just fix a new bug — back in B2 I mapped a generated column with a plain `mapped_column`, reasoning that `Computed()` was purely about who authors the DDL. That was wrong: `Computed()` also tells SQLAlchemy to exclude the column from INSERT statements entirely, which is exactly what a `GENERATED ALWAYS ... STORED` column requires. I'd rather log that I was wrong and why, than leave a decisions log that quietly implies the first fix was fully correct."*

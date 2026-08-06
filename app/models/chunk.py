@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, func, Integer, Text, UniqueConstraint
+from sqlalchemy import Computed, ForeignKey, func, Integer, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -37,5 +37,9 @@ class Chunk(Base):
     # `content` on every insert. Mapped here read-only so ORM queries
     # (e.g. ChunkRepository.get_bm25_matches) can reference it; never set
     # this field directly in Python, Postgres will overwrite/ignore it.
-    content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
+    content_tsvector: Mapped[str | None] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english'::regconfig, content)", persisted=True),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
