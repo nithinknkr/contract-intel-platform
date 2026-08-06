@@ -16,9 +16,9 @@ Legal and procurement teams manually review contracts for risky clauses — unli
 
 ## Solution
 
-Documents are parsed, chunked, embedded, and indexed on upload. A RAG pipeline answers natural-language questions grounded in retrieved chunks with exact source citations. An agentic reviewer (ReAct-style loop) works through a risk checklist autonomously, producing a structured, citation-backed report — replacing hours of manual first-pass review with a defensible draft a human still signs off on.
+Documents are parsed, chunked, embedded, and indexed on upload. A RAG pipeline answers natural-language questions grounded in retrieved chunks with exact source citations, each one programmatically verified against the retrieved context before it's ever returned. An agentic reviewer (ReAct-style loop) works through a risk checklist autonomously, producing a structured, citation-backed report — replacing hours of manual first-pass review with a defensible draft a human still signs off on.
 
-*(Everything below reflects the current state: a fully functional traditional backend, plus the first two layers of the AI/RAG pipeline — local embedding generation with vector storage, and a working hybrid-retrieval grounded Q&A endpoint. Citation verification, the agentic reviewer, and prompt-injection hardening are the next phases.)*
+*(Everything below reflects the current state: a fully functional traditional backend, plus the first three layers of the AI/RAG pipeline — local embedding generation with vector storage, a working hybrid-retrieval grounded Q&A endpoint, and a citation verification layer that catches ungrounded citations before they reach the user. The agentic reviewer and prompt-injection hardening are the next phases.)*
 
 ---
 
@@ -28,7 +28,7 @@ Documents are parsed, chunked, embedded, and indexed on upload. A RAG pipeline a
 
 **Ingestion flow (local dev):** Upload → save to disk → enqueue parse job (Redis/RQ) → worker parses (PyMuPDF/python-docx) → chunks (char-based, 1000/150 overlap) → stored in `chunks` table → on successful parse, a second job embeds each chunk (`BAAI/bge-small-en-v1.5`, local/CPU, no API cost) and writes the vectors to Chroma, tagged with tenant and version metadata for scoped retrieval.
 
-**Grounded Q&A flow (`POST /documents/{id}/ask`):** Question in → BM25 full-text search (Postgres, `chunks.content_tsvector`) and vector similarity search (Chroma) run in parallel → results fused via Reciprocal Rank Fusion (no arbitrary score-weighting between incomparable scales) → top-5 fused chunk IDs resolved to real content through the tenant-scoped repository (Chroma is never trusted with content directly) → question + chunks sent to Groq (`openai/gpt-oss-120b`) with retrieved content explicitly delimited as untrusted data, forced into a schema-enforced structured JSON response → cited chunk_ids sanity-checked against the retrieved set before the answer is returned.
+**Grounded Q&A flow (`POST /documents/{id}/ask`):** Question in → BM25 full-text search (Postgres, `chunks.content_tsvector`) and vector similarity search (Chroma) run in parallel → results fused via Reciprocal Rank Fusion (no arbitrary score-weighting between incomparable scales) → top-5 fused chunk IDs resolved to real content through the tenant-scoped repository (Chroma is never trusted with content directly) → question + chunks sent to Groq (`openai/gpt-oss-120b`) with retrieved content explicitly delimited as untrusted data, forced into a schema-enforced structured JSON response → every citation is checked against the retrieved chunk set two ways — was this chunk_id actually retrieved, and does the quoted text actually appear in that chunk's real content — before the answer is returned. A citation that fails either check is dropped, not the whole answer; the response flags `all_citations_verified` so a caller can tell "nothing to verify" apart from "verification caught something."
 
 ### Request Flow & Layering
 
@@ -36,7 +36,7 @@ Documents are parsed, chunked, embedded, and indexed on upload. A RAG pipeline a
 
 `routers/` (HTTP, JWT validation, `org_id` resolution) → `services/` (business logic) → `repositories/` (tenant-scoped data access — every query filtered by `org_id`) → `models/` (SQLAlchemy ORM). See [decisions log](docs/project1-decisions-log.md) for why this structure was chosen over alternatives.
 
-**Vector search follows the same tenant-isolation philosophy as Postgres, applied to a second data store:** Chroma's metadata filter narrows candidates for relevance and performance, but it is never trusted as the authorization boundary. Vector queries return chunk IDs only, never content — the actual content lookup still goes through the same tenant-scoped repository layer used everywhere else in the system, including in the B2 retrieval pipeline.
+**Vector search follows the same tenant-isolation philosophy as Postgres, applied to a second data store:** Chroma's metadata filter narrows candidates for relevance and performance, but it is never trusted as the authorization boundary. Vector queries return chunk IDs only, never content — the actual content lookup still goes through the same tenant-scoped repository layer used everywhere else in the system, including in the retrieval pipeline.
 
 ---
 
@@ -55,6 +55,7 @@ Documents are parsed, chunked, embedded, and indexed on upload. A RAG pipeline a
 | Keyword search (RAG) | PostgreSQL full-text search (`ts_rank` / `tsvector`, GIN-indexed) |
 | LLM (grounded Q&A) | Groq (`openai/gpt-oss-120b`), schema-enforced structured outputs |
 | Retrieval fusion | Reciprocal Rank Fusion (RRF), combining vector + keyword search |
+| Citation verification | Chunk-membership + normalized quote-grounding check, non-fatal drop-and-flag |
 | Testing | pytest, real Postgres + real Chroma in integration tests |
 | Containerization | Docker (multi-stage build) |
 | Hosting | Render (API), Neon (database) |
@@ -69,7 +70,8 @@ Highlights:
 - **Tenant isolation** enforced at the repository layer — every query scoped by `org_id`, empirically verified with a cross-tenant access test (not just asserted). The same principle now extends to vector search: Chroma's metadata filter is treated as a performance optimization, not a security boundary — content lookups always resolve through the tenant-scoped repository, never directly from the vector store.
 - **Idempotent ingestion** — re-uploading the same document doesn't duplicate chunks; verified by reprocessing an already-completed document and confirming deterministic, byte-identical output. Embedding generation carries the same guarantee.
 - **Hybrid retrieval via Reciprocal Rank Fusion** — vector similarity and BM25 keyword search combined by fusing rank position rather than hand-weighting two incomparable score scales (cosine similarity vs. Postgres `ts_rank`), using the standard RRF constant rather than an invented, hard-to-defend weighting.
-- **Structured, schema-enforced LLM citations** — the LLM's response is forced into a strict JSON schema (`answer` + `citations` with `chunk_id`/`quote`), not parsed out of free text, so citation verification can check facts programmatically instead of via regex. Every cited `chunk_id` is checked against the actual retrieved set before the response is ever returned — caught during manual testing that citation *quality* on negative answers (correctly saying "not found") is weaker than on positive ones, directly motivating the next phase's citation-verification work.
+- **Structured, schema-enforced LLM citations** — the LLM's response is forced into a strict JSON schema (`answer` + `citations` with `chunk_id`/`quote`), not parsed out of free text, so citation verification can check facts programmatically instead of via regex.
+- **Two-layer citation verification, non-fatal by design** — every citation is checked for both chunk_id membership (was this chunk actually retrieved) and quote grounding (does the quote actually appear in that chunk's content). A failed citation is dropped, not treated as grounds to fail the whole request — an earlier, more aggressive version of this check (fail the entire request on any bad chunk_id) was deliberately removed in favor of this graceful behavior. Verified three ways: unit tests against deterministic fixtures, an integration test against the real retrieval pipeline, and a live re-run of a real failure mode found during manual testing (the LLM citing section-header fragments instead of genuine text on a "clause not found" answer) — confirmed the fix catches that exact case, cross-checked independently against the audit log.
 - **Org-wide content-hash deduplication** — catches the realistic failure mode (same file uploaded twice under different names) rather than narrower per-document dedup.
 - **Soft-delete only** for documents — no hard-delete endpoint exists; a legal-tech audit trail should never silently lose evidence of a contract review. The same archived-document check gates the Q&A endpoint before any retrieval or LLM cost is spent.
 - **Access + refresh JWT tokens, no rotation** — a deliberate scope call, not a shortcut: full rotation with reuse detection is the right answer for production systems with real attackers, but a complexity I chose not to build (and couldn't fully defend) for this project's actual threat model.
@@ -120,6 +122,8 @@ API docs available at `http://localhost:8000/docs`.
 pytest --cov=app --cov-report=term-missing
 ```
 
+> Note: `alembic upgrade head` targets whichever database `DATABASE_URL` resolves to at the time it's run — a bare shell invocation loads `.env` (dev), not `.env.test`. To apply migrations to the test database specifically, override the URL for that one command: `DATABASE_URL="<test db url>" alembic upgrade head`. See decisions log (B3) for how this bit us once.
+
 ---
 
 ## Known Limitations
@@ -127,7 +131,7 @@ pytest --cov=app --cov-report=term-missing
 These are documented, deliberate scope boundaries — not undiscovered bugs. Each is logged in detail in the [decisions log](docs/project1-decisions-log.md).
 
 - **No background worker or vector store deployed.** Uploads succeed and are stored on the live demo, but processing (parsing/chunking/embedding) requires a worker and Chroma instance that aren't deployed yet — `parse_status` stays `pending` on production. Fully functional in local dev.
-- **`/ask` citation quality is weaker on negative answers.** When the correct answer is "this isn't covered in the document," the LLM's citations for that refusal are weaker (section-header fragments rather than genuine supporting text) than on positive, fact-grounded answers. The model does not fabricate content — this is a citation-quality gap, not a hallucination — and is the direct motivation for the next phase's citation-verification layer.
+- **Citation verification drops bad citations, not the specific claim they supported.** When a citation fails verification, it's removed from the response and the answer is flagged as not fully verified — but the answer text itself isn't edited to remove the specific unsupported claim, since the current schema doesn't map individual citations to specific sentences. A named limitation, not a workaround.
 - **No OCR support.** Scanned/image-only PDFs fail cleanly with a documented reason rather than silently producing empty results.
 - **No way to add a second user to an existing organization via the API** — signup always creates a new org. A known, named gap, not yet resolved (see decisions log).
 - **No document re-versioning endpoint yet.** The schema and vector-store cleanup logic both support it, but the API path to upload a new version of an existing document doesn't exist yet — a named, deliberately deferred gap rather than a retrofit built just to exercise unused code.
@@ -141,7 +145,7 @@ These are documented, deliberate scope boundaries — not undiscovered bugs. Eac
 - **Phase B** (AI/RAG layer) — in progress
   - ✅ **B1** — Embeddings & vector store: local CPU embedding generation, Chroma integration, tenant-isolated vector search
   - ✅ **B2** — RAG retrieval & grounded Q&A endpoint: hybrid search (BM25 + vector, fused via RRF), Groq LLM with schema-enforced structured citations
-  - B3 — Citation verification layer
+  - ✅ **B3** — Citation verification layer: chunk-membership + quote-grounding checks, non-fatal drop-and-flag, verified against a real previously-observed failure mode
   - B4 — Agentic clause-risk reviewer
   - B5 — Prompt injection defense
   - B6 — RAG/agent evaluation harness
@@ -163,7 +167,8 @@ app/
 ├── routers/       # HTTP endpoints
 ├── schemas/       # Pydantic request/response models
 └── services/      # business logic (parsing, chunking, ingestion, embedding,
-                    # vector store, hybrid retrieval, LLM integration, queue)
+                    # vector store, hybrid retrieval, LLM integration,
+                    # citation verification, queue)
 alembic/           # database migrations
 tests/             # unit + integration tests
 docs/              # decisions log

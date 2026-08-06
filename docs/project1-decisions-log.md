@@ -1297,3 +1297,29 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Why this matters:** This is a direct amendment to a previously-logged decision, not a new independent bug — worth stating honestly rather than quietly re-writing history. The original B2 fix correctly diagnosed *that* the model needed to know about this column, but wrong about *which* SQLAlchemy construct correctly expresses "database-computed, don't ever send a value."
 
 **Interview angle:** *"This is a case where I have to correct my own earlier decision, not just fix a new bug — back in B2 I mapped a generated column with a plain `mapped_column`, reasoning that `Computed()` was purely about who authors the DDL. That was wrong: `Computed()` also tells SQLAlchemy to exclude the column from INSERT statements entirely, which is exactly what a `GENERATED ALWAYS ... STORED` column requires. I'd rather log that I was wrong and why, than leave a decisions log that quietly implies the first fix was fully correct."*
+
+---
+
+## Empirical Verification: Re-Running B2's Negative-Answer Scenario Against the Wired Verifier
+**Phase:** B3
+**Date:** 02-08-2026
+
+**What was done:** Re-ran the exact scenario that motivated B3 in the first place — asking a real, non-synthetic contract (`vendor_services_agreement.pdf`) a question about a clause it doesn't contain ("Does this contract contain a non-compete clause?") — against the fully wired `/ask` endpoint, via live HTTP requests (not a unit test), and inspected both the API response and the audit log directly.
+
+**Result:** The LLM again correctly refused to fabricate a clause, giving an accurate "no non-compete clause" answer that correctly named the topics the contract actually does cover (assignment, force majeure, termination, etc.). But this time, the response's `citations` array came back empty (`[]`) and `all_citations_verified: false` — meaning the LLM did attempt to cite supporting chunks internally, `citation_verifier` caught them, and they were stripped before reaching the caller rather than being silently returned as if they were genuine supporting text. Cross-checked directly against the audit log: `document.citation_verification_failed` fired with two failed citations, both with real `chunk_id`s present in the same request's `retrieved_chunk_ids` (proving they passed membership) but both flagged `quote_not_grounded` (proving they failed grounding) — i.e., the LLM cited real, retrieved chunks while quoting text that wasn't genuinely supporting the negative answer, exactly the B2 failure mode, now caught rather than passed through.
+
+**Why this matters:** This is a real, observed before/after on the same category of failure B2 documented, not a hypothetical or a synthetic fixture — B2 showed the LLM citing section-header-style content on a negative answer and passing it through uninspected; B3 shows the same category of bad citation being generated, caught, and removed, with the removal itself independently confirmed via the audit trail rather than trusted at face value from the API response alone.
+
+**Trade-off accepted:** None — this is verification, not a design trade-off. Worth noting as a limitation of the test itself: this was one manual run against one real document/question pair, not a repeatable automated regression test — that gap is closed by Step 8's integration test.
+
+**Interview angle:** *"B2 documented a real failure mode empirically — my LLM citing section headers instead of genuine text on negative answers — but didn't fix it. For B3 I went back and re-ran that exact scenario against a real contract after wiring in the verifier, and confirmed two things independently: the API response came back with an empty citations list and all_citations_verified=false, and the audit log showed the verifier had caught two citations that passed chunk_id membership but failed quote grounding. That's not a synthetic test proving the code works in theory — it's the actual failure I found in B2, reproduced and caught in B3."*
+
+---
+
+## B3 Final State
+**Phase:** B3
+**Date:** 02-08-2026
+
+**Summary:** Citation verification fully implemented and wired into `POST /documents/{id}/ask`: every citation is checked for chunk_id membership and quote-to-content grounding via `app/services/citation_verifier.py`, a pure, reusable function covered by 6 deterministic unit tests (100% coverage). B2's original fatal membership check was removed and folded into this same non-fatal path — a bad citation now gets dropped and flagged, not treated as a reason to fail the whole request. Verified three ways, each catching something the others wouldn't have: a real live re-run of B2's negative-answer scenario against a genuine contract (proving the fix against actual model behavior, not just fixtures), and two integration tests against the real pipeline (proving both the failure path and, just as importantly, that the verifier doesn't false-positive on genuinely good citations). Along the way, found and fixed two infrastructure bugs unrelated to citation logic itself (test-DB migration drift, an incorrect `Computed()` mapping from B2) — both documented rather than silently patched.
+
+**Interview angle:** *"B3 isn't just 'I added a check' — I verified it three different ways that each catch a different kind of failure: unit tests prove the logic is correct in isolation, an integration test proves it survives contact with the real retrieval pipeline, and a live re-run of a real failure I'd found in B2 proves it actually works against genuine LLM behavior, not just my own test fixtures. I also caught myself making an incomplete fix in B2 and corrected it on the record instead of leaving the decisions log implying it was right the first time."*
