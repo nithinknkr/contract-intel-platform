@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Computed, ForeignKey, func, Integer, Text, UniqueConstraint
+from sqlalchemy import Computed, ForeignKey, func, Index, Integer, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -13,6 +13,16 @@ class Chunk(Base):
     __table_args__ = (
         UniqueConstraint(
             "document_version_id", "chunk_index", name="uq_chunk_version_index"
+        ),
+        # Declares the GIN index that already exists in the real database
+        # (added via hand-written migration c19cf09d49f7, since Alembic's
+        # autogenerate can't detect generated-column expressions -- see B2
+        # decisions log). Without this declaration, the model and the live
+        # schema disagree about whether this index should exist, and every
+        # future unrelated autogenerate run proposes to drop it. See B4
+        # Step 1 decisions log entry for the concrete incident this caused.
+        Index(
+            "ix_chunks_content_tsvector", "content_tsvector", postgresql_using="gin"
         ),
     )
 

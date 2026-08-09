@@ -1347,3 +1347,50 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 
 ---
 
+## Step 1: Schema Design — risk_reviews / risk_flags
+**Phase:** B4
+**Date:** 09-08-2026
+
+**Options considered:** (a) `risk_flags.category`/`verdict` as free-text strings, matching `audit_log.action`'s open-ended-vocabulary reasoning, vs (b) real Postgres enums, matching `document_versions.parse_status`/`users.role`'s closed-state-machine reasoning. Also: tie `risk_reviews` to `document_id` only vs `document_version_id` specifically.
+
+**Chosen:** (b) — real enums for both `category` (`risk_category`) and `verdict` (`risk_verdict`). `risk_reviews.document_version_id` is a required FK (not just `document_id`), tying every review to the exact version it was run against.
+
+**Why:** The audit log's free-text `action` field is free-text specifically because its vocabulary is open-ended and growing across phases — the opposite is true here. The 6 risk categories are a fixed, closed checklist decided once in Step 2; adding a 7th category is a deliberate schema change, not a routine event type, so it should require a migration, the same reasoning already applied to `parse_status`/`role`. Tying reviews to `document_version_id` (not just `document_id`) means a review against v1 of a contract can never be silently conflated with v2 after an amendment — directly reusing the version-awareness already built into the schema since A2/A3, rather than treating B4 as if versioning didn't exist.
+
+**Trade-off accepted:** Adding a 7th risk category later requires an Alembic migration to extend the `risk_category` enum, not just a config change — a deliberate cost in exchange for the schema refusing to silently accept an unrecognized category string.
+
+**Interview angle:** *"I used real Postgres enums for the risk category and verdict fields, not free text — the opposite call from my audit log's action field, and deliberately so. The audit log's vocabulary is open-ended and meant to grow; the risk checklist is a fixed, closed set I decided once. I also tied every review to a specific document_version_id, not just the document, so a review against an old version of a contract can never get silently conflated with a newer amended version — reusing version-awareness I'd already built into the schema back in A2."*
+
+---
+
+## Step 1: FK Delete Behavior — CASCADE for risk_flags, RESTRICT Elsewhere
+**Phase:** B4
+**Date:** 09-08-2026
+
+**Options considered:** RESTRICT everywhere (the A2 default) vs CASCADE specifically for `risk_flags.risk_review_id`.
+
+**Chosen:** `risk_flags.risk_review_id` → CASCADE. `risk_reviews.org_id`/`document_id`/`document_version_id` → RESTRICT.
+
+**Why:** Identical reasoning to `chunks.document_version_id` → CASCADE from A3: a risk flag has no independent existence apart from its parent review, so deleting a review should take its flags with it. Everything else stays RESTRICT by default, consistent with the project-wide convention, even though nothing currently hard-deletes documents/versions/orgs — explicit rather than silently inherited, same reasoning as the original A2 entry on this exact point.
+
+**Trade-off accepted:** None material — this mirrors an already-justified pattern rather than introducing a new one.
+
+**Interview angle:** *"Risk flags cascade-delete with their parent review for the same reason chunks cascade-delete with their document version — they're derived data with no meaning on their own. Everything else in this schema stays RESTRICT by default, which I made explicit even though nothing currently exercises it, consistent with how I've handled every other FK in this project."*
+
+---
+
+## Step 1: Bug — Autogenerate Falsely Flagged an Unrelated Index Drop on `chunks`
+**Phase:** B4
+**Date:** 09-08-2026
+
+**What was found:** `alembic revision --autogenerate` for the new tables also produced `op.drop_index('ix_chunks_content_tsvector', ..., postgresql_using='gin')` in the generated migration — a change with zero relation to `risk_reviews`/`risk_flags`. Root cause: the `Chunk` model's `content_tsvector` column (mapped via `Computed()` since the B3 correction) was never paired with a matching `Index(...)` declaration in `Chunk.__table_args__`, even though the GIN index exists in the real database via a hand-written B2 migration. Alembic compares live schema against model metadata; since the model doesn't declare that index, autogenerate concluded it should be dropped.
+
+**Fix:** Manually removed the spurious `drop_index`/matching `downgrade` `create_index` pair from the generated migration before applying it — this migration only touches the two new tables. Root cause not yet fixed on the model itself (see below).
+
+**Why this matters:** Same underlying class of bug as two separate B2/B3 entries (`content_tsvector` missing from the ORM model entirely, then mapped with the wrong construct) — model/database drift on this exact column, a third time, in a third form. This is the concrete cost of not closing that loop fully back in B3: every future unrelated autogenerate on this schema will keep proposing to drop this index until the model actually declares it.
+
+**Trade-off accepted:** Deliberately caught and hand-corrected per-migration rather than blocking B4 to fix the model right away — but flagged explicitly as a recurring, not one-off, gap, with a fix scheduled immediately after this log entry rather than deferred indefinitely.
+
+**Interview angle:** *"This is the third time the same column — chunks.content_tsvector — has caused a model/database mismatch, across three different phases. This time it wasn't a runtime error, it was autogenerate proposing to silently drop a GIN index my full-text search depends on, in a migration that had nothing to do with it. I caught it by actually reading the generated diff line by line before applying it, rather than trusting autogenerate output blindly — which is exactly the discipline this project has required since the very first autogenerate surprise back in A4."*
+
+---
