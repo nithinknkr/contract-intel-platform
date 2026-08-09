@@ -1323,3 +1323,27 @@ Interview angle: "This endpoint has a known, deliberately deferred tenant-isolat
 **Summary:** Citation verification fully implemented and wired into `POST /documents/{id}/ask`: every citation is checked for chunk_id membership and quote-to-content grounding via `app/services/citation_verifier.py`, a pure, reusable function covered by 6 deterministic unit tests (100% coverage). B2's original fatal membership check was removed and folded into this same non-fatal path — a bad citation now gets dropped and flagged, not treated as a reason to fail the whole request. Verified three ways, each catching something the others wouldn't have: a real live re-run of B2's negative-answer scenario against a genuine contract (proving the fix against actual model behavior, not just fixtures), and two integration tests against the real pipeline (proving both the failure path and, just as importantly, that the verifier doesn't false-positive on genuinely good citations). Along the way, found and fixed two infrastructure bugs unrelated to citation logic itself (test-DB migration drift, an incorrect `Computed()` mapping from B2) — both documented rather than silently patched.
 
 **Interview angle:** *"B3 isn't just 'I added a check' — I verified it three different ways that each catch a different kind of failure: unit tests prove the logic is correct in isolation, an integration test proves it survives contact with the real retrieval pipeline, and a live re-run of a real failure I'd found in B2 proves it actually works against genuine LLM behavior, not just my own test fixtures. I also caught myself making an incomplete fix in B2 and corrected it on the record instead of leaving the decisions log implying it was right the first time."*
+
+# Phase B4 Decisions
+
+---
+
+## Step 0: Naive Single-Prompt Baseline — Tested, No Clear Failure Found on Available Test Document
+**Phase:** B4
+**Date:** 08-08-2026
+
+**What was done:** Built a throwaway script (`test_naive_risk_review.py`, deleted after this entry) running all 6 risk categories through a single Groq call — one retrieval pass per category, all retrieved context and the full checklist merged into one prompt, one structured JSON response covering every category at once. Tested against `vendor_services_agreement.pdf` (11 chunks total) under two conditions: normal retrieval (top-5/category) and artificially truncated retrieval (top-2/category, simulating thinner context on a larger document where a category's evidence is less likely to land near the top).
+
+**Result:** In both conditions, the naive single-shot design correctly returned all 6 categories with no missing/duplicated categories, no visible reasoning-blending across categories, and verdicts matching the contract's actual terms. Citation grounding failures traced to a single, specific, recurring cause — the model truncating one long ALL-CAPS liability clause with an ellipsis despite an explicit anti-truncation instruction added to the prompt — not to architectural confusion from handling 6 categories simultaneously. This exact failure would occur identically inside a per-category loop, since it's a per-citation quoting behavior, not a cross-category interference effect; it's the existing B3 citation verifier, not the loop, that catches and drops it correctly under both conditions.
+
+**Why the checklist loop was still chosen despite this:** The naive approach's apparent robustness here is a property of the test document (11 chunks total — even "thin" top-2 retrieval still surfaces each category's relevant clause, since there's so little content for it to miss), not evidence the single-shot design would hold up on a real 40–60 page contract. The loop's actual justification rests on architectural reasoning this test document is too small to exercise:
+1. Prompt size scales with document size × category count in the single-shot design, with no natural ceiling — this test's prompt was already 6,800–9,300 characters for a toy document.
+2. Single-shot retrieval has no mechanism to recover if a category's first retrieval misses the relevant clause, which becomes more likely as document size and clause-phrasing indirection grow.
+3. Per-category execution gives isolated retry and failure attribution that a single merged call structurally cannot.
+
+**Trade-off accepted:** This is a documented negative result, not a demonstrated bug — stated honestly rather than dressed up as a clean before/after win, consistent with this project's stated preference for honest self-correction over a convenient narrative.
+
+**Interview angle:** *"I tested the naive single-prompt approach before building the loop, including an artificially thinned-retrieval stress test, and it didn't actually break on my available test document — I'd rather say that honestly than claim a bug I didn't find. The real justification for the checklist loop is architectural: this test document only has 11 chunks, so even deliberately thin retrieval couldn't miss anything. On a real-length contract, prompt size and retrieval-miss risk both scale in ways this test document is too small to expose. I did find one genuinely interesting thing, though — a specific long clause the model consistently truncates with an ellipsis no matter how I word the instruction, which is exactly why I don't rely on prompting alone for citation integrity — B3's programmatic grounding check catches it every time, regardless of architecture."*
+
+---
+
